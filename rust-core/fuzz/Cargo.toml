@@ -1,0 +1,24 @@
+[package]
+name = "tgwsproxy-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+aes = "0.8"
+ctr = "0.9"
+byteorder = "1"
+
+[[bin]]
+name = "msg_splitter"
+path = "fuzz_targets/msg_splitter.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

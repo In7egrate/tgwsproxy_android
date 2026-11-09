@@ -1,17 +1,46 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.egg-info/
-dist/
-build/
-*.spec.bak
-venv/
-.venv/
+# General generated build output
+/build/
+/dist/
 
-# PyInstaller
-*.manifest
-*.log
+# Rust
+/rust-core/target/
+**/target/
+
+# Android / Gradle generated files
+.gradle/
+**/.gradle/
+**/build/
+**/.cxx/
+**/.externalNativeBuild/
+**/.kotlin/
+**/local.properties
+*.iml
+captures/
+output.json
+
+# Generated native libraries are rebuilt from rust-core during every build.
+/android/app/src/main/jniLibs/**/*.so
+
+# Android build artifacts
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.hprof
+
+# Signing material and local secrets — never commit these.
+**/keystore/
+**/keystore.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+.env
+.env.*
+!.env.example
 
 # IDE
 .vscode/
@@ -23,5 +52,16 @@ venv/
 Thumbs.db
 Desktop.ini
 .DS_Store
-
 /icon.icns
+
+# Logs and temporary output
+*.log
+*.tmp
+*.temp
+*.download
+/release/
+/artifacts/
+
+# Local patch/history artifacts are not part of the source release.
+/*.patch
+/history/

@@ -1,0 +1,28 @@
+# Gradle / Android Studio
+.gradle/
+**/build/
+local.properties
+*.iml
+.idea/
+captures/
+.cxx/
+.externalNativeBuild/
+.kotlin/
+output.json
+
+# Generated Rust native libraries (rebuilt by build_v3.ps1 / CI)
+/app/src/main/jniLibs/**/*.so
+
+# APK / bundle outputs
+*.apk
+*.aab
+
+# Signing credentials — never commit these.
+keystore/
+keystore.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
