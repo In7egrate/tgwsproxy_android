@@ -214,6 +214,28 @@ impl Balancer {
         metric.connect_samples = metric.connect_samples.saturating_add(1);
     }
 
+    /// Record handshake/connect timing for a prewarmed socket without
+    /// treating the handshake as end-to-end route success.
+    pub fn record_connect_sample(
+        &mut self,
+        dc_id: i32,
+        route_kind: &str,
+        route: &str,
+        elapsed: Duration,
+    ) {
+        let key = Self::metric_key(dc_id, route_kind, route);
+        let metric = self.metric_mut(key);
+        metric.last_updated = Instant::now();
+        let sample_ms = (elapsed.as_secs_f64() * 1_000.0).clamp(1.0, 30_000.0);
+        metric.connect_latency_ewma_ms = if metric.connect_samples == 0 {
+            sample_ms
+        } else {
+            EWMA_ALPHA * sample_ms
+                + (1.0 - EWMA_ALPHA) * metric.connect_latency_ewma_ms
+        };
+        metric.connect_samples = metric.connect_samples.saturating_add(1);
+    }
+
     /// Record a successful end-to-end probe only after the first upstream
     /// application frame reaches the client, not after the WS handshake.
     pub fn record_first_byte_success(
