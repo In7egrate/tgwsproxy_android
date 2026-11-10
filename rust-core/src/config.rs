@@ -45,6 +45,7 @@ pub const RESERVED_FIRST_BYTE: u8 = 0xEF;
 
 pub const BRIDGE_READ_TIMEOUT: Duration = Duration::from_secs(120);
 pub const FIRST_UPSTREAM_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
+pub const HALF_OPEN_PROBE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const BRIDGE_PING_INTERVAL: Duration = Duration::from_secs(30);
 pub const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const WS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
