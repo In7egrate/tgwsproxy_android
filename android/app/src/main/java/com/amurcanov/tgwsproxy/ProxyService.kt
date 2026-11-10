@@ -73,6 +73,7 @@ class ProxyService : Service() {
     private var lastNetworkFingerprint: String? = null
     private var lastWakeLockAcquire = 0L
     private var lastTunnelAttempt = 0L
+    private var serviceStartAttempts = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -139,6 +140,8 @@ class ProxyService : Service() {
     }
 
     private fun startProxy(cfg: ProxyConfig) {
+        val startStartedAt = android.os.SystemClock.elapsedRealtime()
+        serviceStartAttempts = (serviceStartAttempts + 1).coerceAtMost(Int.MAX_VALUE)
         if (isRunning) {
             val healthy = runCatching {
                 JSONObject(RustBridge.status(this)).optString("state") == "running"
@@ -153,7 +156,10 @@ class ProxyService : Service() {
             Log.w(TAG, "Kotlin service flag is running but native health check failed; restarting core")
             stopProxy()
         }
-        DiagnosticStore.record(this, "service_start_requested")
+        DiagnosticStore.record(
+            this,
+            "service_start_requested attempt=$serviceStartAttempts",
+        )
         acquireWakeLock()
         try {
             val status = RustBridge.start(this, cfg.toJson())
@@ -162,7 +168,10 @@ class ProxyService : Service() {
             isRunning = state == "running"
 
             if (isRunning) {
-                DiagnosticStore.record(this, "service_started")
+                DiagnosticStore.record(
+                    this,
+                    "service_started attempt=$serviceStartAttempts elapsed_ms=${android.os.SystemClock.elapsedRealtime() - startStartedAt}",
+                )
                 Log.i(TAG, "Прокси запущен на ${cfg.host}:${cfg.port}")
                 ui.post { maybeRaiseTunnel() }
                 ui.post {
@@ -173,13 +182,19 @@ class ProxyService : Service() {
                 }
             } else {
                 val err = json.optString("error").ifEmpty { state }
-                DiagnosticStore.record(this, "service_start_failed state=${state.take(80)}")
+                DiagnosticStore.record(
+                    this,
+                    "service_start_failed state=${state.take(80)} error=${err.take(120)} attempt=$serviceStartAttempts elapsed_ms=${android.os.SystemClock.elapsedRealtime() - startStartedAt}",
+                )
                 Log.e(TAG, "Прокси не запустился: $err")
                 releaseWakeLock()
                 ui.post { updateNotification(err) }
             }
         } catch (t: Throwable) {
-            DiagnosticStore.record(this, "service_start_exception type=${t.javaClass.simpleName}")
+            DiagnosticStore.record(
+                this,
+                "service_start_exception type=${t.javaClass.simpleName} attempt=$serviceStartAttempts elapsed_ms=${android.os.SystemClock.elapsedRealtime() - startStartedAt}",
+            )
             Log.e(TAG, "Ошибка запуска прокси", t)
             isRunning = false
             releaseWakeLock()
