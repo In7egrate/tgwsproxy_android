@@ -2655,7 +2655,7 @@ async fn serve_core<R, W>(
 
         lwarn!(" direct retry fresh ws DC{}{}", dc, m_tag);
         let (retry_ws, retry_failed_redirect, retry_all_redirects) =
-            connect_direct_ws(dc, &target, &domains, ws_timeout, ws_path).await;
+            connect_direct_ws(dc, &target, &domains, ws_timeout, ws_path, &cancel_token).await;
         match retry_ws {
             None => {
                 if retry_failed_redirect && retry_all_redirects {
@@ -2742,14 +2742,15 @@ async fn serve_core<R, W>(
     .await;
 }
 
-// connectDirectWS — прямой перебор доменов (тихий, для retry-пути).
+// connectDirectWS — direct retry path with the same breaker and concurrency policy.
 pub async fn connect_direct_ws(
     dc: i32,
     target: &str,
     domains: &[String],
     timeout: f64,
     ws_path: &str,
-) -> (Option<RawWebSocket>, bool, bool) {
+    cancel_token: &CancellationToken,
+) -> (Option<(RawWebSocket, String, Instant)>, bool, bool) {
     if domains.is_empty() {
         return (None, false, false);
     }
@@ -2759,33 +2760,48 @@ pub async fn connect_direct_ws(
     let mut ws_failed_redirect = false;
     let mut all_redirects = true;
 
-    for dom in &candidates {
-        let started = Instant::now();
-        let attempt = ws_connect_full_opts(target, dom, ws_path, timeout, None, None).await;
-        if attempt.is_ok() {
-            crate::balancer::BALANCER.write().record_success(
-                dc, "telegram_ws", dom, started.elapsed()
-            );
-        } else {
-            crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", dom);
+    for domain in &candidates {
+        let _route_permits = tokio::select! {
+            _ = cancel_token.cancelled() => return (None, ws_failed_redirect, false),
+            result = acquire_route_connect_slot(dc, "telegram_ws", domain) => match result {
+                Some(permits) => permits,
+                None => continue,
+            },
+        };
+        if !crate::balancer::BALANCER.write().allow_attempt(dc, "telegram_ws", domain) {
+            record_diagnostic(&format!("route_circuit_skip kind=telegram_ws dc={}", dc));
+            continue;
         }
+        let started = Instant::now();
+        let attempt = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                crate::balancer::BALANCER.write().release_attempt(dc, "telegram_ws", domain);
+                return (None, ws_failed_redirect, false);
+            }
+            result = ws_connect_full_opts(target, domain, ws_path, timeout, None, None) => result,
+        };
         match attempt {
-            Ok(ws) => return (Some(ws), ws_failed_redirect, false),
-            Err(WsError::Handshake(h)) => {
+            Ok(ws) => return (Some((ws, domain.clone(), started)), ws_failed_redirect, false),
+            Err(WsError::Handshake(handshake)) => {
+                crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", domain);
                 STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
-                if h.is_redirect() {
+                if handshake.is_redirect() {
                     ws_failed_redirect = true;
                 } else {
                     all_redirects = false;
                 }
             }
             Err(WsError::Timeout) => {
-                // A timeout says nothing about redirect policy; continue with
-                // the next Telegram hostname and never blacklist on this result.
+                crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", domain);
                 STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
                 all_redirects = false;
             }
+            Err(WsError::Canceled) => {
+                crate::balancer::BALANCER.write().release_attempt(dc, "telegram_ws", domain);
+                all_redirects = false;
+            }
             Err(_) => {
+                crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", domain);
                 STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
                 all_redirects = false;
             }
