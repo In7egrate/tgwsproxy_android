@@ -2699,7 +2699,17 @@ async fn serve_core<R, W>(
                 }
             };
             let route_started = Instant::now();
-            let attempt = ws_connect_full_opts(&target, domain, ws_path, ws_timeout, None, None).await;
+            let attempt = tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    crate::balancer::BALANCER.write().cancel_attempt(
+                        dc, "telegram_ws", domain, attempt_kind
+                    );
+                    return;
+                }
+                result = ws_connect_full_opts(
+                    &target, domain, ws_path, ws_timeout, None, None
+                ) => result,
+            };
             match &attempt {
                 Ok(_) => crate::balancer::BALANCER.write().record_connect_success(
                     dc, "telegram_ws", domain, route_started.elapsed(), attempt_kind
