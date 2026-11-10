@@ -479,6 +479,7 @@ impl WsPool {
             if self.generation.load(Ordering::Acquire) != generation {
                 return None;
             }
+            let route_generation = crate::balancer::BALANCER.read().generation();
             let attempt_kind = match crate::balancer::BALANCER
                 .write()
                 .begin_attempt(dc, "telegram_ws", &domain)
@@ -547,7 +548,9 @@ impl WsPool {
             };
             match attempt {
                 Ok(ws) => {
-                    if self.generation.load(Ordering::Acquire) != generation {
+                    if self.generation.load(Ordering::Acquire) != generation
+                        || crate::balancer::BALANCER.read().generation() != route_generation
+                    {
                         crate::balancer::BALANCER.write().cancel_attempt(
                             dc, "telegram_ws", &domain, attempt_kind
                         );
@@ -566,6 +569,14 @@ impl WsPool {
                     return None;
                 }
                 Err(_) => {
+                    if self.generation.load(Ordering::Acquire) != generation
+                        || crate::balancer::BALANCER.read().generation() != route_generation
+                    {
+                        crate::balancer::BALANCER.write().cancel_attempt(
+                            dc, "telegram_ws", &domain, attempt_kind
+                        );
+                        return None;
+                    }
                     crate::balancer::BALANCER.write().record_attempt_failure(
                         dc, "telegram_ws", &domain, attempt_kind
                     );
@@ -1055,6 +1066,7 @@ impl CfWorkerPool {
             if self.generation.load(Ordering::Acquire) != generation {
                 return None;
             }
+            let route_generation = crate::balancer::BALANCER.read().generation();
             let attempt_kind = match crate::balancer::BALANCER
                 .write()
                 .begin_attempt(dc, "cf_worker", &worker_domain)
@@ -1099,7 +1111,9 @@ impl CfWorkerPool {
             };
             match attempt {
                 Ok(ws) => {
-                    if self.generation.load(Ordering::Acquire) != generation {
+                    if self.generation.load(Ordering::Acquire) != generation
+                        || crate::balancer::BALANCER.read().generation() != route_generation
+                    {
                         crate::balancer::BALANCER.write().cancel_attempt(
                             dc, "cf_worker", &worker_domain, attempt_kind
                         );
@@ -1118,6 +1132,14 @@ impl CfWorkerPool {
                     return None;
                 }
                 Err(exc) => {
+                    if self.generation.load(Ordering::Acquire) != generation
+                        || crate::balancer::BALANCER.read().generation() != route_generation
+                    {
+                        crate::balancer::BALANCER.write().cancel_attempt(
+                            dc, "cf_worker", &worker_domain, attempt_kind
+                        );
+                        return None;
+                    }
                     crate::balancer::BALANCER.write().record_attempt_failure(
                         dc, "cf_worker", &worker_domain, attempt_kind
                     );
