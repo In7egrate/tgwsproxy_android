@@ -456,8 +456,13 @@ impl WsPool {
                         }
                     }
                 }
-                if let Some((socket, _route, budget_permit)) = candidate {
+                if let Some((socket, route, budget_permit)) = candidate {
                     socket.close().await;
+                    crate::balancer::BALANCER.write().release_validation(
+                        slot.dc,
+                        "telegram_ws",
+                        &route,
+                    );
                     drop(budget_permit);
                 }
             }
@@ -934,12 +939,14 @@ impl CfWorkerPool {
                         } else {
                             drop(map);
                             ws.close().await;
+                            crate::balancer::BALANCER.write().release_validation(dc, "cf_worker", &domain);
                             drop(budget_permit);
                             record_diagnostic(&format!("cf_pool_refill_discard dc={}", dc));
                         }
                     } else {
                         drop(map);
                         ws.close().await;
+                        crate::balancer::BALANCER.write().release_validation(dc, "cf_worker", &domain);
                         drop(budget_permit);
                         record_diagnostic(&format!("cf_pool_refill_stale_generation dc={}", dc));
                     }
