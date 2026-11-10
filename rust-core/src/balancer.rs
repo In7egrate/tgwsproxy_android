@@ -1,6 +1,6 @@
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use rand::seq::SliceRandom;
+use rand::{seq::SliceRandom, Rng};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -22,6 +22,8 @@ struct RouteMetric {
     samples: u64,
     consecutive_failures: u32,
     cooldown_until: Option<Instant>,
+    circuit_open_until: Option<Instant>,
+    half_open_probe_until: Option<Instant>,
     last_updated: Instant,
 }
 
@@ -33,6 +35,8 @@ impl Default for RouteMetric {
             samples: 0,
             consecutive_failures: 0,
             cooldown_until: None,
+            circuit_open_until: None,
+            half_open_probe_until: None,
             last_updated: Instant::now(),
         }
     }
@@ -41,7 +45,9 @@ impl Default for RouteMetric {
 const EWMA_ALPHA: f64 = 0.2;
 const UNKNOWN_ROUTE_SCORE: f64 = 1_000.0;
 const FAILURE_PENALTY: f64 = 4.0;
-const MAX_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
+const MAX_FAILURE_COOLDOWN: Duration = Duration::from_secs(120);
+const CIRCUIT_BASE_COOLDOWN: Duration = Duration::from_secs(5);
+const HALF_OPEN_PROBE_LEASE: Duration = Duration::from_secs(20);
 const MAX_ROUTE_METRICS: usize = 512;
 
 pub static BALANCER: Lazy<RwLock<Balancer>> = Lazy::new(|| RwLock::new(Balancer::new()));
@@ -128,6 +134,46 @@ impl Balancer {
         self.route_metrics.entry(key).or_default()
     }
 
+    fn circuit_failure_threshold(route_kind: &str) -> u32 {
+        match route_kind.to_ascii_lowercase().as_str() {
+            "telegram_ws" | "tcp_fallback" => 2,
+            "cf_proxy" | "cf_worker" => 3,
+            _ => 3,
+        }
+    }
+
+    /// Returns true when a connection attempt may start. An expired open
+    /// circuit grants exactly one half-open probe; concurrent callers are
+    /// rejected until that probe reports success/failure or its lease expires.
+    pub fn allow_attempt(&mut self, dc_id: i32, route_kind: &str, route: &str) -> bool {
+        let key = Self::metric_key(dc_id, route_kind, route);
+        let metric = self.metric_mut(key);
+        let now = Instant::now();
+
+        match metric.circuit_open_until {
+            Some(until) if until > now => false,
+            Some(_) => {
+                if metric.half_open_probe_until.map(|until| until > now).unwrap_or(false) {
+                    false
+                } else {
+                    metric.half_open_probe_until = Some(now + HALF_OPEN_PROBE_LEASE);
+                    true
+                }
+            }
+            None => true,
+        }
+    }
+
+    /// Release a half-open probe when the attempt is canceled before a
+    /// transport result is available. The lease is also bounded as a safeguard.
+    pub fn release_attempt(&mut self, dc_id: i32, route_kind: &str, route: &str) {
+        let key = Self::metric_key(dc_id, route_kind, route);
+        if let Some(metric) = self.route_metrics.get_mut(&key) {
+            metric.half_open_probe_until = None;
+            metric.last_updated = Instant::now();
+        }
+    }
+
     pub fn record_success(
         &mut self,
         dc_id: i32,
@@ -152,6 +198,8 @@ impl Balancer {
         metric.samples = metric.samples.saturating_add(1);
         metric.consecutive_failures = 0;
         metric.cooldown_until = None;
+        metric.circuit_open_until = None;
+        metric.half_open_probe_until = None;
     }
 
     pub fn record_failure(&mut self, dc_id: i32, route_kind: &str, route: &str) {
@@ -167,11 +215,26 @@ impl Balancer {
         metric.samples = metric.samples.saturating_add(1);
         metric.consecutive_failures = metric.consecutive_failures.saturating_add(1);
 
-        let shift = metric.consecutive_failures.saturating_sub(1).min(5);
-        let seconds = 1u64.checked_shl(shift).unwrap_or(32).min(
-            MAX_FAILURE_COOLDOWN.as_secs(),
-        );
-        metric.cooldown_until = Some(Instant::now() + Duration::from_secs(seconds));
+        let now = Instant::now();
+        metric.half_open_probe_until = None;
+        let threshold = Self::circuit_failure_threshold(route_kind);
+        if metric.consecutive_failures >= threshold {
+            let shift = metric.consecutive_failures.saturating_sub(threshold).min(5);
+            let base = CIRCUIT_BASE_COOLDOWN
+                .as_millis()
+                .saturating_mul(1u128.checked_shl(shift).unwrap_or(32) as u128)
+                .min(MAX_FAILURE_COOLDOWN.as_millis()) as u64;
+            // +/-20% jitter prevents a fleet of clients on the same mobile
+            // carrier from reopening a failed route in lockstep.
+            let jitter_percent = rand::thread_rng().gen_range(80u64..=120u64);
+            let delay_ms = base.saturating_mul(jitter_percent) / 100;
+            let until = now + Duration::from_millis(delay_ms);
+            metric.circuit_open_until = Some(until);
+            metric.cooldown_until = Some(until);
+        } else {
+            let shift = metric.consecutive_failures.saturating_sub(1).min(1);
+            metric.cooldown_until = Some(now + Duration::from_secs(1u64 << shift));
+        }
     }
 
     pub fn reset_route_metrics(&mut self) {
@@ -186,13 +249,19 @@ impl Balancer {
         };
 
         let reliability_penalty = 1.0 + FAILURE_PENALTY * (1.0 - metric.success_ewma);
+        let now = Instant::now();
         let cooldown_penalty = metric
             .cooldown_until
-            .filter(|until| *until > Instant::now())
+            .filter(|until| *until > now)
             .map(|_| 60_000.0)
             .unwrap_or(0.0);
+        let circuit_penalty = metric
+            .circuit_open_until
+            .filter(|until| *until > now)
+            .map(|_| 120_000.0)
+            .unwrap_or(0.0);
 
-        metric.latency_ewma_ms * reliability_penalty + cooldown_penalty
+        metric.latency_ewma_ms * reliability_penalty + cooldown_penalty + circuit_penalty
     }
 
     /// Stable sort: routes with equal/unseen scores retain their caller-provided
@@ -234,11 +303,27 @@ impl Balancer {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 route.hash(&mut hasher);
                 let route_id = format!("{:016x}", hasher.finish());
+                let now = Instant::now();
                 let cooldown_remaining_ms = metric
                     .cooldown_until
-                    .filter(|until| *until > Instant::now())
-                    .map(|until| until.saturating_duration_since(Instant::now()).as_millis() as u64)
+                    .filter(|until| *until > now)
+                    .map(|until| until.saturating_duration_since(now).as_millis() as u64)
                     .unwrap_or(0);
+                let open_remaining_ms = metric
+                    .circuit_open_until
+                    .filter(|until| *until > now)
+                    .map(|until| until.saturating_duration_since(now).as_millis() as u64)
+                    .unwrap_or(0);
+                let probe_in_flight = metric.half_open_probe_until
+                    .map(|until| until > now)
+                    .unwrap_or(false);
+                let circuit_state = if open_remaining_ms > 0 {
+                    "open"
+                } else if metric.circuit_open_until.is_some() || probe_in_flight {
+                    "half_open"
+                } else {
+                    "closed"
+                };
                 serde_json::json!({
                     "dc": dc,
                     "kind": kind,
@@ -247,6 +332,10 @@ impl Balancer {
                     "latency_ewma_ms": metric.latency_ewma_ms.round() as u64,
                     "success_rate_permille": (metric.success_ewma * 1000.0).round() as u16,
                     "cooldown_remaining_ms": cooldown_remaining_ms,
+                    "circuit_state": circuit_state,
+                    "consecutive_failures": metric.consecutive_failures,
+                    "open_remaining_ms": open_remaining_ms,
+                    "half_open_probe_in_flight": probe_in_flight,
                 })
             })
             .collect();
@@ -335,6 +424,54 @@ mod adaptive_route_tests {
             balancer.route_score(2, "telegram_ws", "kws2.web.telegram.org"),
             UNKNOWN_ROUTE_SCORE
         );
+    }
+
+    #[test]
+    fn direct_route_opens_after_repeated_failures_and_skips_attempts() {
+        let mut balancer = Balancer::new();
+        balancer.record_failure(2, "telegram_ws", "kws2.web.telegram.org");
+        assert!(balancer.allow_attempt(2, "telegram_ws", "kws2.web.telegram.org"));
+        balancer.record_failure(2, "telegram_ws", "kws2.web.telegram.org");
+        assert!(!balancer.allow_attempt(2, "telegram_ws", "kws2.web.telegram.org"));
+    }
+
+    #[test]
+    fn half_open_allows_only_one_probe() {
+        let mut balancer = Balancer::new();
+        balancer.record_failure(2, "telegram_ws", "kws2.web.telegram.org");
+        balancer.record_failure(2, "telegram_ws", "kws2.web.telegram.org");
+        let key = Balancer::metric_key(2, "telegram_ws", "kws2.web.telegram.org");
+        balancer.route_metrics.get_mut(&key).unwrap().circuit_open_until =
+            Some(Instant::now() - Duration::from_secs(1));
+        assert!(balancer.allow_attempt(2, "telegram_ws", "kws2.web.telegram.org"));
+        assert!(!balancer.allow_attempt(2, "telegram_ws", "kws2.web.telegram.org"));
+    }
+
+    #[test]
+    fn successful_half_open_probe_closes_circuit() {
+        let mut balancer = Balancer::new();
+        balancer.record_failure(2, "telegram_ws", "kws2.web.telegram.org");
+        balancer.record_failure(2, "telegram_ws", "kws2.web.telegram.org");
+        let key = Balancer::metric_key(2, "telegram_ws", "kws2.web.telegram.org");
+        balancer.route_metrics.get_mut(&key).unwrap().circuit_open_until =
+            Some(Instant::now() - Duration::from_secs(1));
+        assert!(balancer.allow_attempt(2, "telegram_ws", "kws2.web.telegram.org"));
+        balancer.record_success(2, "telegram_ws", "kws2.web.telegram.org", Duration::from_millis(90));
+        assert!(balancer.allow_attempt(2, "telegram_ws", "kws2.web.telegram.org"));
+        assert_eq!(balancer.route_metrics.get(&key).unwrap().consecutive_failures, 0);
+    }
+
+    #[test]
+    fn canceled_half_open_probe_releases_its_lease() {
+        let mut balancer = Balancer::new();
+        balancer.record_failure(2, "telegram_ws", "kws2.web.telegram.org");
+        balancer.record_failure(2, "telegram_ws", "kws2.web.telegram.org");
+        let key = Balancer::metric_key(2, "telegram_ws", "kws2.web.telegram.org");
+        balancer.route_metrics.get_mut(&key).unwrap().circuit_open_until =
+            Some(Instant::now() - Duration::from_secs(1));
+        assert!(balancer.allow_attempt(2, "telegram_ws", "kws2.web.telegram.org"));
+        balancer.release_attempt(2, "telegram_ws", "kws2.web.telegram.org");
+        assert!(balancer.allow_attempt(2, "telegram_ws", "kws2.web.telegram.org"));
     }
 
     #[test]
