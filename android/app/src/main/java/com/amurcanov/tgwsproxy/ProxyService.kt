@@ -70,9 +70,9 @@ class ProxyService : Service() {
     private var notifTicker: Runnable? = null
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var lastNetEvent = 0L
-    private var currentDefaultNetwork: Network? = null
-    private var hasSeenDefaultNetwork = false
-    private var lastNetworkSnapshot: NetworkTransportSnapshot? = null
+    @Volatile private var currentDefaultNetwork: Network? = null
+    @Volatile private var hasSeenDefaultNetwork = false
+    @Volatile private var lastNetworkSnapshot: NetworkTransportSnapshot? = null
     private var lastWakeLockAcquire = 0L
     private var lastTunnelAttempt = 0L
 
