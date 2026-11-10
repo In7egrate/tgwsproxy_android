@@ -70,7 +70,9 @@ class ProxyService : Service() {
     private var notifTicker: Runnable? = null
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var lastNetEvent = 0L
-    private var lastVpn = false
+    private var currentDefaultNetwork: Network? = null
+    private var hasSeenDefaultNetwork = false
+    private var lastNetworkSnapshot: NetworkTransportSnapshot? = null
     private var lastWakeLockAcquire = 0L
     private var lastTunnelAttempt = 0L
 
@@ -173,13 +175,15 @@ class ProxyService : Service() {
                 }
             } else {
                 val err = json.optString("error").ifEmpty { state }
-                DiagnosticStore.record(this, "service_start_failed state=${state.take(80)}")
+                val safeError = err.replace('\\r', ' ').replace('\\n', ' ').take(120)
+                DiagnosticStore.record(this, "service_start_failed state=${state.take(80)} error=$safeError")
                 Log.e(TAG, "Прокси не запустился: $err")
                 releaseWakeLock()
                 ui.post { updateNotification(err) }
             }
         } catch (t: Throwable) {
-            DiagnosticStore.record(this, "service_start_exception type=${t.javaClass.simpleName}")
+            val safeError = (t.message ?: "").replace('\\r', ' ').replace('\\n', ' ').take(120)
+            DiagnosticStore.record(this, "service_start_exception type=${t.javaClass.simpleName} message=$safeError")
             Log.e(TAG, "Ошибка запуска прокси", t)
             isRunning = false
             releaseWakeLock()
@@ -233,37 +237,78 @@ class ProxyService : Service() {
     private fun registerNetworkCallback() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) = notifyChange("available")
-            override fun onLost(network: Network) = notifyChange("lost")
+            override fun onAvailable(network: Network) {
+                val previous = currentDefaultNetwork
+                val previouslySeen = hasSeenDefaultNetwork
+                currentDefaultNetwork = network
+                hasSeenDefaultNetwork = true
+                val changedCapabilities = cm.getNetworkCapabilities(network)?.let {
+                    updateNetworkSnapshot(it, "available")
+                } ?: false
+                if ((previous != null && previous != network) || (previouslySeen && previous == null)) {
+                    notifyChange("network_default_changed")
+                } else if (changedCapabilities) {
+                    notifyChange("network_transport_changed")
+                } else {
+                    DiagnosticStore.record(this@ProxyService, "network_event=default_available_initial")
+                }
+            }
+
+            override fun onLost(network: Network) {
+                // The old default network can be reported lost after the new
+                // default has already arrived. Never reset the new route for a
+                // stale onLost callback.
+                if (currentDefaultNetwork == network) {
+                    currentDefaultNetwork = null
+                    lastNetworkSnapshot = null
+                    notifyChange("network_default_lost")
+                } else {
+                    DiagnosticStore.record(this@ProxyService, "network_event=non_default_lost")
+                }
+            }
+
             override fun onCapabilitiesChanged(
                 network: Network,
                 caps: NetworkCapabilities,
             ) {
-                val vpn = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-                if (vpn != lastVpn) {
-                    lastVpn = vpn
-                    notifyChange(if (vpn) "vpn_up" else "vpn_down")
+                if (currentDefaultNetwork != network) return
+                if (updateNetworkSnapshot(caps, "capabilities")) {
+                    notifyChange("network_transport_changed")
                 }
             }
         }
         netCallback = cb
         try {
-            // ВАЖНО: именно registerDefaultNetworkCallback, а не собственный
-            // NetworkRequest. NetworkRequest.Builder() по умолчанию добавляет
-            // NET_CAPABILITY_NOT_VPN, из-за чего подъём VPN (ByeDPI и любой
-            // другой) под фильтр НЕ подпадает и остаётся незамеченным —
-            // проверено на устройстве. Дефолтный колбэк следует за той сетью,
-            // которой реально пользуется приложение, включая VPN.
+            // Follow the actual default route, including VPN overlays.
             cm.registerDefaultNetworkCallback(cb)
+            cm.activeNetwork?.let { active ->
+                if (currentDefaultNetwork == null) currentDefaultNetwork = active
+                cm.getNetworkCapabilities(active)?.let { updateNetworkSnapshot(it, "registration") }
+            }
         } catch (t: Throwable) {
             Log.w(TAG, "Не удалось подписаться на смену сети", t)
             netCallback = null
         }
     }
 
+    private fun updateNetworkSnapshot(
+        capabilities: NetworkCapabilities,
+        source: String,
+    ): Boolean {
+        val snapshot = NetworkTransportClassifier.from(capabilities)
+        val previous = lastNetworkSnapshot
+        lastNetworkSnapshot = snapshot
+        if (previous != snapshot) {
+            DiagnosticStore.record(this, "network_capabilities source=$source ${snapshot.diagnostic()}")
+        }
+        return previous != null && previous.routeKey != snapshot.routeKey
+    }
+
     private fun unregisterNetworkCallback() {
         val cb = netCallback ?: return
         netCallback = null
+        currentDefaultNetwork = null
+        lastNetworkSnapshot = null
         try {
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             cm.unregisterNetworkCallback(cb)
@@ -280,13 +325,17 @@ class ProxyService : Service() {
         // и пауза съедала второе событие: пул оставался с сокетами, убитыми
         // сменой маршрута, а клиент молча ждал ответа. Поэтому смену состояния
         // VPN пропускаем всегда, паузу применяем только к рядовым событиям.
-        val isVpnTransition = what.startsWith("vpn_")
-        if (!isVpnTransition && now - lastNetEvent < 3000) return
+        val isForcedTransition = what.startsWith("vpn_") || what.startsWith("network_")
+        if (!isForcedTransition && now - lastNetEvent < 3000) return
         lastNetEvent = now
         DiagnosticStore.record(this, "network_event=$what")
         Log.i(TAG, "Смена сети: $what")
         workerHandler?.post {
-            runCatching { RustBridge.onNetworkChange(what) }
+            val result = runCatching { RustBridge.onNetworkChange(what) }
+            DiagnosticStore.record(
+                this,
+                "network_recovery event=$what status=${result.getOrElse { "error" }}",
+            )
         }
     }
 
