@@ -2854,6 +2854,7 @@ async fn serve_core<R, W>(
                     .get(dc, is_media, target.clone(), domains)
                     .await
                 {
+                    let route_generation = crate::balancer::BALANCER.read().generation();
                     let pool_attempt = {
                         crate::balancer::BALANCER
                             .write()
@@ -2867,6 +2868,7 @@ async fn serve_core<R, W>(
                             route,
                             attempt_kind,
                             connected_at: Instant::now(),
+                            generation: route_generation,
                         });
                         pooled_ws = Some(ws);
                     } else {
@@ -2940,6 +2942,7 @@ async fn serve_core<R, W>(
             .get(dc, is_media, target.clone(), domains.clone())
             .await
         {
+            let route_generation = crate::balancer::BALANCER.read().generation();
             let pool_attempt = {
                 crate::balancer::BALANCER
                     .write()
@@ -2953,6 +2956,7 @@ async fn serve_core<R, W>(
                     route,
                     attempt_kind,
                     connected_at: Instant::now(),
+                    generation: route_generation,
                 });
                 ws_opt = Some(ws);
                 linfo!("[{}] DC{}{} -> pool hit via {}", label, dc, m_tag, target);
@@ -2967,6 +2971,7 @@ async fn serve_core<R, W>(
         for domain in &domains {
             let url = format!("wss://{}{} via {}", domain, ws_path, target);
             linfo!("[{}] DC{}{} -> {}", label, dc, m_tag, url);
+            let route_generation = crate::balancer::BALANCER.read().generation();
             let attempt_kind = match crate::balancer::BALANCER
                 .write()
                 .begin_attempt(dc, "telegram_ws", domain)
@@ -3006,6 +3011,16 @@ async fn serve_core<R, W>(
                     &target, domain, ws_path, ws_timeout, None, None
                 ) => result,
             };
+            if crate::balancer::BALANCER.read().generation() != route_generation {
+                if let Ok(stale_ws) = attempt {
+                    stale_ws.close().await;
+                }
+                crate::balancer::BALANCER.write().cancel_attempt(
+                    dc, "telegram_ws", domain, attempt_kind
+                );
+                record_diagnostic("ws_direct_result_ignored reason=network_generation_changed");
+                continue;
+            }
             match &attempt {
                 Ok(_) => crate::balancer::BALANCER.write().record_connect_success(
                     dc, "telegram_ws", domain, route_started.elapsed(), attempt_kind
@@ -3025,6 +3040,7 @@ async fn serve_core<R, W>(
                         route: domain.clone(),
                         attempt_kind,
                         connected_at: route_started,
+                        generation: route_generation,
                     });
                     record_diagnostic(&format!("ws_direct_connect_ok dc={} media={}", dc, is_media as u8));
                     all_redirects = false;
