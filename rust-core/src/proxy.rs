@@ -972,21 +972,22 @@ impl CfWorkerPool {
             if self.generation.load(Ordering::Acquire) != generation {
                 return None;
             }
-            let started = Instant::now();
+            let _route_permits = acquire_route_connect_slot(dc, "cf_worker", &worker_domain).await?;
+            if !crate::balancer::BALANCER.write().allow_attempt(dc, "cf_worker", &worker_domain) {
+                record_diagnostic(&format!("route_circuit_skip kind=cf_worker dc={}", dc));
+                continue;
+            }
             match ws_connect_full_opts(&worker_domain, &worker_domain, &path, 8.0, None, Some(secure))
                 .await
             {
-                Ok(ws) => {
-                    crate::balancer::BALANCER.write().record_success(
-                        dc, "cf_worker", &worker_domain, started.elapsed()
-                    );
-                    return Some((ws, worker_domain));
-                }
+                Ok(ws) => return Some((ws, worker_domain)),
                 Err(exc) => {
-                    crate::balancer::BALANCER.write().record_failure(
-                        dc, "cf_worker", &worker_domain
-                    );
-                    self.report_failure_generation(&worker_domain, &exc, generation).await;
+                    if matches!(&exc, WsError::Canceled) {
+                        crate::balancer::BALANCER.write().release_attempt(dc, "cf_worker", &worker_domain);
+                    } else {
+                        crate::balancer::BALANCER.write().record_failure(dc, "cf_worker", &worker_domain);
+                        self.report_failure_generation(&worker_domain, &exc, generation).await;
+                    }
                 }
             }
         }
