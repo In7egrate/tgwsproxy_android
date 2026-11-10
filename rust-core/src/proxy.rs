@@ -1582,7 +1582,6 @@ pub async fn bridge_tcp<CR, CW>(
     tg_enc: TrackedStream,
     tg_dec: TrackedStream,
     cancel_token: CancellationToken,
-    route_observation: Option<RouteObservation>,
 ) where
     CR: AsyncReadExt + Unpin + Send + 'static,
     CW: AsyncWriteExt + Unpin + Send + 'static,
@@ -2565,10 +2564,12 @@ async fn serve_core<R, W>(
                     .get(dc, is_media, target.clone(), domains)
                     .await
                 {
-                    if let Some(attempt_kind) = crate::balancer::BALANCER
-                        .write()
-                        .begin_attempt(dc, "telegram_ws", &route)
-                    {
+                    let pool_attempt = {
+                        crate::balancer::BALANCER
+                            .write()
+                            .begin_attempt(dc, "telegram_ws", &route)
+                    };
+                    if let Some(attempt_kind) = pool_attempt {
                         STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
                         pooled_observation = Some(RouteObservation {
                             dc_id: dc,
@@ -2649,10 +2650,12 @@ async fn serve_core<R, W>(
             .get(dc, is_media, target.clone(), domains.clone())
             .await
         {
-            if let Some(attempt_kind) = crate::balancer::BALANCER
-                .write()
-                .begin_attempt(dc, "telegram_ws", &route)
-            {
+            let pool_attempt = {
+                crate::balancer::BALANCER
+                    .write()
+                    .begin_attempt(dc, "telegram_ws", &route)
+            };
+            if let Some(attempt_kind) = pool_attempt {
                 STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
                 route_observation = Some(RouteObservation {
                     dc_id: dc,
