@@ -69,8 +69,8 @@ class ProxyService : Service() {
     private val ui = Handler(android.os.Looper.getMainLooper())
     private var notifTicker: Runnable? = null
     private var netCallback: ConnectivityManager.NetworkCallback? = null
-    private var lastNetEvent = 0L
-    private var lastVpn = false
+    private var defaultNetwork: Network? = null
+    private var lastNetworkFingerprint: String? = null
     private var lastWakeLockAcquire = 0L
     private var lastTunnelAttempt = 0L
 
@@ -222,42 +222,50 @@ class ProxyService : Service() {
         super.onDestroy()
     }
 
-    // смена сети
+    // Смена физического/виртуального сетевого транспорта.
 
     /**
-     * Переключение Wi-Fi ↔ мобильная сеть, а также подъём и падение VPN
-     * (например, ByeDPI) рвут все установленные сокеты. Ядро запоминает эти
-     * отказы и потом до часа обходит WebSocket стороной. Сообщаем ему, что
-     * сеть новая и прошлые отказы больше не актуальны.
+     * The default-network callback follows the network actually used by this
+     * process. Keep only transport/capability metadata: never export IPs,
+     * interface names, SSIDs, BSSIDs, or Network.toString().
      */
     private fun registerNetworkCallback() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) = notifyChange("available")
-            override fun onLost(network: Network) = notifyChange("lost")
+            override fun onAvailable(network: Network) {
+                defaultNetwork = network
+                updateNetworkState(network, "available")
+            }
+
+            override fun onLost(network: Network) {
+                if (defaultNetwork != network) return
+                val active = cm.activeNetwork
+                defaultNetwork = active
+                updateNetworkState(active, "lost")
+            }
+
             override fun onCapabilitiesChanged(
                 network: Network,
                 caps: NetworkCapabilities,
             ) {
-                val vpn = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-                if (vpn != lastVpn) {
-                    lastVpn = vpn
-                    notifyChange(if (vpn) "vpn_up" else "vpn_down")
-                }
+                if (defaultNetwork != null && defaultNetwork != network) return
+                defaultNetwork = network
+                updateNetworkState(network, "capabilities", caps)
             }
         }
         netCallback = cb
         try {
-            // ВАЖНО: именно registerDefaultNetworkCallback, а не собственный
-            // NetworkRequest. NetworkRequest.Builder() по умолчанию добавляет
-            // NET_CAPABILITY_NOT_VPN, из-за чего подъём VPN (ByeDPI и любой
-            // другой) под фильтр НЕ подпадает и остаётся незамеченным —
-            // проверено на устройстве. Дефолтный колбэк следует за той сетью,
-            // которой реально пользуется приложение, включая VPN.
             cm.registerDefaultNetworkCallback(cb)
+            val active = cm.activeNetwork
+            defaultNetwork = active
+            updateNetworkState(active, "initial")
         } catch (t: Throwable) {
             Log.w(TAG, "Не удалось подписаться на смену сети", t)
             netCallback = null
+            DiagnosticStore.record(
+                this,
+                "network_callback_registration_failed type=${t.javaClass.simpleName}",
+            )
         }
     }
 
@@ -272,21 +280,58 @@ class ProxyService : Service() {
         }
     }
 
-    private fun notifyChange(what: String) {
-        if (!isRunning) return
-        val now = System.currentTimeMillis()
-        // Система сыпет событиями пачками, поэтому пауза нужна. Но подъём и
-        // падение VPN идут вплотную друг за другом (выключил ByeDPI — включил),
-        // и пауза съедала второе событие: пул оставался с сокетами, убитыми
-        // сменой маршрута, а клиент молча ждал ответа. Поэтому смену состояния
-        // VPN пропускаем всегда, паузу применяем только к рядовым событиям.
-        val isVpnTransition = what.startsWith("vpn_")
-        if (!isVpnTransition && now - lastNetEvent < 3000) return
-        lastNetEvent = now
-        DiagnosticStore.record(this, "network_event=$what")
-        Log.i(TAG, "Смена сети: $what")
-        workerHandler?.post {
-            runCatching { RustBridge.onNetworkChange(what) }
+    private fun updateNetworkState(
+        network: Network?,
+        reason: String,
+        suppliedCapabilities: NetworkCapabilities? = null,
+    ) {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val caps = suppliedCapabilities ?: network?.let { cm.getNetworkCapabilities(it) }
+        val transports = mutableListOf<String>()
+        if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true) transports += "cellular"
+        if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) transports += "wifi"
+        if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) transports += "vpn"
+        if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true) transports += "ethernet"
+        if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_BLUETOOTH) == true) transports += "bluetooth"
+
+        val transport = transports.joinToString("+").ifEmpty { "unknown" }
+        val internet = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+        val validated = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+        val metered = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) != true
+        val notRoaming = if (Build.VERSION.SDK_INT >= 28) {
+            caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING) == true
+        } else {
+            null
+        }
+        val vpn = caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+        val descriptor = buildString {
+            append("transport=").append(transport)
+            append(" internet=").append(if (internet) 1 else 0)
+            append(" validated=").append(if (validated) 1 else 0)
+            append(" metered=").append(if (metered) 1 else 0)
+            append(" vpn=").append(if (vpn) 1 else 0)
+            if (notRoaming != null) append(" not_roaming=").append(if (notRoaming) 1 else 0)
+            if (vpn) append(" underlying=not_exposed")
+        }
+
+        // Network.hashCode is used only in-memory to distinguish two different
+        // networks with the same transport; the identifier itself is not logged.
+        val fingerprint = "${network?.hashCode() ?: -1}|$descriptor"
+        if (fingerprint == lastNetworkFingerprint) return
+        lastNetworkFingerprint = fingerprint
+
+        DiagnosticStore.record(this, "network_event=$reason $descriptor")
+        Log.i(TAG, "Network changed: $reason $descriptor")
+        if (isRunning) {
+            workerHandler?.post {
+                runCatching { RustBridge.onNetworkChange("$reason $descriptor") }
+                    .onFailure {
+                        DiagnosticStore.record(
+                            this,
+                            "network_handover_reset_failed type=${it.javaClass.simpleName}",
+                        )
+                    }
+            }
         }
     }
 
