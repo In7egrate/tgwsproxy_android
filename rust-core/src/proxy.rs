@@ -941,7 +941,7 @@ impl CfWorkerPool {
                 .await
             {
                 Ok(ws) => {
-                    crate::balancer::BALANCER.write().record_success(
+                    crate::balancer::BALANCER.write().record_connect_sample(
                         dc, "cf_worker", &worker_domain, started.elapsed()
                     );
                     return Some((ws, worker_domain));
@@ -1653,7 +1653,7 @@ where
     let mut remote =
         match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await {
             Ok(Ok(r)) => {
-                crate::balancer::BALANCER.write().record_success(
+                crate::balancer::BALANCER.write().record_connect_sample(
                     dc, "tcp_fallback", &addr, tcp_started.elapsed()
                 );
                 record_diagnostic(&format!("tcp_fallback_connect_ok duration_ms={}", tcp_started.elapsed().as_millis()));
