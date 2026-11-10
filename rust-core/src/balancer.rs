@@ -172,6 +172,17 @@ impl Balancer {
     /// Reserve one dial for this (DC, transport, route). Closed routes are
     /// serialized per route; an expired Open circuit admits exactly one
     /// Half-Open recovery probe.
+    pub fn begin_attempt_with_generation(
+        &mut self,
+        dc_id: i32,
+        route_kind: &str,
+        route: &str,
+    ) -> Option<(RouteAttemptKind, u64)> {
+        let generation = self.generation;
+        self.begin_attempt(dc_id, route_kind, route)
+            .map(|attempt| (attempt, generation))
+    }
+
     pub fn begin_attempt(
         &mut self,
         dc_id: i32,
@@ -224,6 +235,22 @@ impl Balancer {
                 + (1.0 - EWMA_ALPHA) * metric.connect_latency_ewma_ms
         };
         metric.connect_samples = metric.connect_samples.saturating_add(1);
+    }
+
+    pub fn record_connect_success_for_generation(
+        &mut self,
+        generation: u64,
+        dc_id: i32,
+        route_kind: &str,
+        route: &str,
+        elapsed: Duration,
+        attempt: RouteAttemptKind,
+    ) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.record_connect_success(dc_id, route_kind, route, elapsed, attempt);
+        true
     }
 
     /// Record handshake/connect timing for a prewarmed socket without
@@ -362,6 +389,21 @@ impl Balancer {
         self.record_first_byte_success(dc_id, route_kind, route, elapsed);
     }
 
+    pub fn record_attempt_failure_for_generation(
+        &mut self,
+        generation: u64,
+        dc_id: i32,
+        route_kind: &str,
+        route: &str,
+        attempt: RouteAttemptKind,
+    ) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.record_attempt_failure(dc_id, route_kind, route, attempt);
+        true
+    }
+
     pub fn record_attempt_failure(
         &mut self,
         dc_id: i32,
@@ -408,6 +450,21 @@ impl Balancer {
             return false;
         }
         self.release_probe(dc_id, route_kind, route, attempt);
+        true
+    }
+
+    pub fn cancel_attempt_for_generation(
+        &mut self,
+        generation: u64,
+        dc_id: i32,
+        route_kind: &str,
+        route: &str,
+        attempt: RouteAttemptKind,
+    ) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.cancel_attempt(dc_id, route_kind, route, attempt);
         true
     }
 
@@ -794,6 +851,42 @@ mod adaptive_route_tests {
             balancer.route_score(2, "telegram_ws", "kws2.web.telegram.org"),
             UNKNOWN_ROUTE_SCORE
         );
+    }
+
+    #[test]
+    fn reset_invalidates_old_attempt_completion_without_decrementing_new_dial() {
+        let mut balancer = Balancer::new();
+        let (old_attempt, old_generation) = balancer
+            .begin_attempt_with_generation(2, "telegram_ws", "kws2.web.telegram.org")
+            .unwrap();
+        balancer.reset_route_metrics();
+        let (new_attempt, new_generation) = balancer
+            .begin_attempt_with_generation(2, "telegram_ws", "kws2.web.telegram.org")
+            .unwrap();
+        assert_ne!(old_generation, new_generation);
+        assert!(!balancer.cancel_attempt_for_generation(
+            old_generation,
+            2,
+            "telegram_ws",
+            "kws2.web.telegram.org",
+            old_attempt,
+        ));
+        assert!(!balancer.record_attempt_failure_for_generation(
+            old_generation,
+            2,
+            "telegram_ws",
+            "kws2.web.telegram.org",
+            old_attempt,
+        ));
+        let key = Balancer::metric_key(2, "telegram_ws", "kws2.web.telegram.org");
+        assert_eq!(balancer.route_metrics.get(&key).unwrap().in_flight_dials, 1);
+        assert!(balancer.cancel_attempt_for_generation(
+            new_generation,
+            2,
+            "telegram_ws",
+            "kws2.web.telegram.org",
+            new_attempt,
+        ));
     }
 
     #[test]
