@@ -50,7 +50,7 @@ const FAILURE_PENALTY: f64 = 4.0;
 const MAX_FAILURE_COOLDOWN: Duration = Duration::from_secs(120);
 const CIRCUIT_BASE_COOLDOWN: Duration = Duration::from_secs(5);
 const HALF_OPEN_PROBE_LEASE: Duration = Duration::from_secs(20);
-const ROUTE_VALIDATION_LEASE: Duration = Duration::from_secs(30);
+const ROUTE_VALIDATION_LEASE: Duration = Duration::from_secs(15);
 const MAX_ROUTE_METRICS: usize = 512;
 
 pub static BALANCER: Lazy<RwLock<Balancer>> = Lazy::new(|| RwLock::new(Balancer::new()));
