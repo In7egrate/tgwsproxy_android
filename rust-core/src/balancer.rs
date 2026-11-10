@@ -24,6 +24,7 @@ struct RouteMetric {
     cooldown_until: Option<Instant>,
     circuit_open_until: Option<Instant>,
     half_open_probe_until: Option<Instant>,
+    pending_validation_until: Option<Instant>,
     last_updated: Instant,
 }
 
@@ -37,6 +38,7 @@ impl Default for RouteMetric {
             cooldown_until: None,
             circuit_open_until: None,
             half_open_probe_until: None,
+            pending_validation_until: None,
             last_updated: Instant::now(),
         }
     }
@@ -48,6 +50,7 @@ const FAILURE_PENALTY: f64 = 4.0;
 const MAX_FAILURE_COOLDOWN: Duration = Duration::from_secs(120);
 const CIRCUIT_BASE_COOLDOWN: Duration = Duration::from_secs(5);
 const HALF_OPEN_PROBE_LEASE: Duration = Duration::from_secs(20);
+const ROUTE_VALIDATION_LEASE: Duration = Duration::from_secs(30);
 const MAX_ROUTE_METRICS: usize = 512;
 
 pub static BALANCER: Lazy<RwLock<Balancer>> = Lazy::new(|| RwLock::new(Balancer::new()));
@@ -149,6 +152,9 @@ impl Balancer {
         let key = Self::metric_key(dc_id, route_kind, route);
         let metric = self.metric_mut(key);
         let now = Instant::now();
+        if metric.pending_validation_until.map(|until| until > now).unwrap_or(false) {
+            return false;
+        }
 
         match metric.circuit_open_until {
             Some(until) if until > now => false,
@@ -164,12 +170,31 @@ impl Balancer {
         }
     }
 
+    /// Mark a completed transport handshake as awaiting its first real upstream
+    /// payload. While this lease is active, duplicate handshakes for the same
+    /// route are suppressed. A response, failure, or lease expiry resolves it.
+    pub fn mark_pending_validation(&mut self, dc_id: i32, route_kind: &str, route: &str) {
+        let key = Self::metric_key(dc_id, route_kind, route);
+        let metric = self.metric_mut(key);
+        metric.pending_validation_until = Some(Instant::now() + ROUTE_VALIDATION_LEASE);
+        metric.last_updated = Instant::now();
+    }
+
+    pub fn release_validation(&mut self, dc_id: i32, route_kind: &str, route: &str) {
+        let key = Self::metric_key(dc_id, route_kind, route);
+        if let Some(metric) = self.route_metrics.get_mut(&key) {
+            metric.pending_validation_until = None;
+            metric.last_updated = Instant::now();
+        }
+    }
+
     /// Release a half-open probe when the attempt is canceled before a
     /// transport result is available. The lease is also bounded as a safeguard.
     pub fn release_attempt(&mut self, dc_id: i32, route_kind: &str, route: &str) {
         let key = Self::metric_key(dc_id, route_kind, route);
         if let Some(metric) = self.route_metrics.get_mut(&key) {
             metric.half_open_probe_until = None;
+            metric.pending_validation_until = None;
             metric.last_updated = Instant::now();
         }
     }
@@ -200,6 +225,7 @@ impl Balancer {
         metric.cooldown_until = None;
         metric.circuit_open_until = None;
         metric.half_open_probe_until = None;
+        metric.pending_validation_until = None;
     }
 
     pub fn record_failure(&mut self, dc_id: i32, route_kind: &str, route: &str) {
@@ -217,6 +243,7 @@ impl Balancer {
 
         let now = Instant::now();
         metric.half_open_probe_until = None;
+        metric.pending_validation_until = None;
         let threshold = Self::circuit_failure_threshold(route_kind);
         if metric.consecutive_failures >= threshold {
             let shift = metric.consecutive_failures.saturating_sub(threshold).min(5);
@@ -317,10 +344,15 @@ impl Balancer {
                 let probe_in_flight = metric.half_open_probe_until
                     .map(|until| until > now)
                     .unwrap_or(false);
+                let validation_pending = metric.pending_validation_until
+                    .map(|until| until > now)
+                    .unwrap_or(false);
                 let circuit_state = if open_remaining_ms > 0 {
                     "open"
-                } else if metric.circuit_open_until.is_some() || probe_in_flight {
+                } else if probe_in_flight || metric.circuit_open_until.is_some() {
                     "half_open"
+                } else if validation_pending {
+                    "validating"
                 } else {
                     "closed"
                 };
@@ -336,6 +368,7 @@ impl Balancer {
                     "consecutive_failures": metric.consecutive_failures,
                     "open_remaining_ms": open_remaining_ms,
                     "half_open_probe_in_flight": probe_in_flight,
+                    "validation_pending": validation_pending,
                 })
             })
             .collect();
@@ -459,6 +492,15 @@ mod adaptive_route_tests {
         balancer.record_success(2, "telegram_ws", "kws2.web.telegram.org", Duration::from_millis(90));
         assert!(balancer.allow_attempt(2, "telegram_ws", "kws2.web.telegram.org"));
         assert_eq!(balancer.route_metrics.get(&key).unwrap().consecutive_failures, 0);
+    }
+
+    #[test]
+    fn pending_first_byte_validation_suppresses_duplicate_handshakes() {
+        let mut balancer = Balancer::new();
+        balancer.mark_pending_validation(2, "telegram_ws", "kws2.web.telegram.org");
+        assert!(!balancer.allow_attempt(2, "telegram_ws", "kws2.web.telegram.org"));
+        balancer.record_success(2, "telegram_ws", "kws2.web.telegram.org", Duration::from_millis(110));
+        assert!(balancer.allow_attempt(2, "telegram_ws", "kws2.web.telegram.org"));
     }
 
     #[test]
