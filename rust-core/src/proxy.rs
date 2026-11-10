@@ -385,10 +385,9 @@ impl WsPool {
                 if pool.generation.load(Ordering::Acquire) != generation {
                     return None;
                 }
-                let socket = tokio::select! {
-                    _ = cancel.cancelled() => None,
-                    result = connect_one_ws_with_domain(&target_ip, &domains) => result,
-                };
+                let socket = pool
+                    .connect_one_route(slot.dc, &target_ip, &domains, &cancel, generation)
+                    .await;
                 socket.map(|(ws, route)| (ws, route, permit))
             });
         }
@@ -461,6 +460,119 @@ impl WsPool {
             if slot.is_media != 0 { "m" } else { "" },
             state.queue.lock().await.len()
         );
+    }
+
+    async fn connect_one_route(
+        &self,
+        dc: i32,
+        target_ip: &str,
+        domains: &[String],
+        cancel: &CancellationToken,
+        generation: u64,
+    ) -> Option<(RawWebSocket, String)> {
+        let candidates = crate::balancer::BALANCER
+            .read()
+            .rank_candidates(dc, "telegram_ws", domains);
+        let fronting_first = ws_pool_fronting_first();
+
+        for domain in candidates {
+            if self.generation.load(Ordering::Acquire) != generation {
+                return None;
+            }
+            let attempt_kind = match crate::balancer::BALANCER
+                .write()
+                .begin_attempt(dc, "telegram_ws", &domain)
+            {
+                Some(RouteAttemptKind::Closed) => {
+                    STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
+                    RouteAttemptKind::Closed
+                }
+                Some(RouteAttemptKind::HalfOpen) => {
+                    // A prewarmed idle socket cannot prove application health.
+                    // Leave recovery probes to a real client session.
+                    crate::balancer::BALANCER.write().cancel_attempt(
+                        dc, "telegram_ws", &domain, RouteAttemptKind::HalfOpen
+                    );
+                    continue;
+                }
+                None => {
+                    STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            let _dial_permit = match try_direct_ws_dial_slot() {
+                Some(permit) => permit,
+                None => {
+                    crate::balancer::BALANCER.write().cancel_attempt(
+                        dc, "telegram_ws", &domain, attempt_kind
+                    );
+                    record_diagnostic("direct_ws_dial_budget_saturated pool=1");
+                    continue;
+                }
+            };
+            let started = Instant::now();
+            let attempt = tokio::select! {
+                _ = cancel.cancelled() => {
+                    crate::balancer::BALANCER.write().cancel_attempt(
+                        dc, "telegram_ws", &domain, attempt_kind
+                    );
+                    return None;
+                }
+                result = async {
+                    if fronting_first {
+                        if let Some(ws) = connect_fronted(target_ip, &domain, WS_PATH).await {
+                            return Ok(ws);
+                        }
+                    }
+                    match ws_connect_full_opts(
+                        target_ip, &domain, WS_PATH, WS_POOL_CONNECT_TIMEOUT,
+                        None, Some(true)
+                    ).await {
+                        Ok(ws) => {
+                            set_ws_pool_fronting_first(false);
+                            Ok(ws)
+                        }
+                        Err(error) if !fronting_first
+                            && matches!(&error, WsError::Timeout | WsError::Io(_)) =>
+                        {
+                            if let Some(ws) = connect_fronted(target_ip, &domain, WS_PATH).await {
+                                Ok(ws)
+                            } else {
+                                Err(error)
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
+                } => result,
+            };
+            match attempt {
+                Ok(ws) => {
+                    if self.generation.load(Ordering::Acquire) != generation {
+                        crate::balancer::BALANCER.write().cancel_attempt(
+                            dc, "telegram_ws", &domain, attempt_kind
+                        );
+                        ws.close().await;
+                        return None;
+                    }
+                    crate::balancer::BALANCER.write().record_connect_success(
+                        dc, "telegram_ws", &domain, started.elapsed(), attempt_kind
+                    );
+                    return Some((ws, domain));
+                }
+                Err(WsError::Canceled) => {
+                    crate::balancer::BALANCER.write().cancel_attempt(
+                        dc, "telegram_ws", &domain, attempt_kind
+                    );
+                    return None;
+                }
+                Err(_) => {
+                    crate::balancer::BALANCER.write().record_attempt_failure(
+                        dc, "telegram_ws", &domain, attempt_kind
+                    );
+                }
+            }
+        }
+        None
     }
 
     pub async fn report_success(&self, dc: i32, is_media: bool) {
@@ -874,12 +986,11 @@ impl CfWorkerPool {
                     result = pool.budget.clone().acquire_owned() => result.ok(),
                 };
                 let connected = if let Some(permit) = permit {
-                    tokio::select! {
-                        _ = cancel.cancelled() => None,
-                        result = pool.connect_one(worker_domains, fallback_dst, dc, generation) => {
-                            result.map(|(ws, domain)| (ws, domain, permit))
-                        },
-                    }
+                    pool.connect_one(
+                        worker_domains, fallback_dst, dc, generation, cancel.clone()
+                    )
+                    .await
+                    .map(|(ws, domain)| (ws, domain, permit))
                 } else {
                     None
                 };
@@ -931,6 +1042,7 @@ impl CfWorkerPool {
         fallback_dst: String,
         dc: i32,
         generation: u64,
+        cancel: CancellationToken,
     ) -> Option<(RawWebSocket, String)> {
         let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
         let query = format!("dst={}&dc={}", fallback_dst, dc);
@@ -943,19 +1055,71 @@ impl CfWorkerPool {
             if self.generation.load(Ordering::Acquire) != generation {
                 return None;
             }
-            let started = Instant::now();
-            match ws_connect_full_opts(&worker_domain, &worker_domain, &path, 8.0, None, Some(secure))
-                .await
+            let attempt_kind = match crate::balancer::BALANCER
+                .write()
+                .begin_attempt(dc, "cf_worker", &worker_domain)
             {
+                Some(RouteAttemptKind::Closed) => {
+                    STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
+                    RouteAttemptKind::Closed
+                }
+                Some(RouteAttemptKind::HalfOpen) => {
+                    // Do not reserve recovery on an idle prewarmed socket.
+                    crate::balancer::BALANCER.write().cancel_attempt(
+                        dc, "cf_worker", &worker_domain, RouteAttemptKind::HalfOpen
+                    );
+                    continue;
+                }
+                None => {
+                    STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            let _dial_permit = match try_direct_ws_dial_slot() {
+                Some(permit) => permit,
+                None => {
+                    crate::balancer::BALANCER.write().cancel_attempt(
+                        dc, "cf_worker", &worker_domain, attempt_kind
+                    );
+                    record_diagnostic("direct_ws_dial_budget_saturated kind=cf_worker_pool");
+                    continue;
+                }
+            };
+            let started = Instant::now();
+            let attempt = tokio::select! {
+                _ = cancel.cancelled() => {
+                    crate::balancer::BALANCER.write().cancel_attempt(
+                        dc, "cf_worker", &worker_domain, attempt_kind
+                    );
+                    return None;
+                }
+                result = ws_connect_full_opts(
+                    &worker_domain, &worker_domain, &path, 8.0, None, Some(secure)
+                ) => result,
+            };
+            match attempt {
                 Ok(ws) => {
-                    crate::balancer::BALANCER.write().record_connect_sample(
-                        dc, "cf_worker", &worker_domain, started.elapsed()
+                    if self.generation.load(Ordering::Acquire) != generation {
+                        crate::balancer::BALANCER.write().cancel_attempt(
+                            dc, "cf_worker", &worker_domain, attempt_kind
+                        );
+                        ws.close().await;
+                        return None;
+                    }
+                    crate::balancer::BALANCER.write().record_connect_success(
+                        dc, "cf_worker", &worker_domain, started.elapsed(), attempt_kind
                     );
                     return Some((ws, worker_domain));
                 }
+                Err(WsError::Canceled) => {
+                    crate::balancer::BALANCER.write().cancel_attempt(
+                        dc, "cf_worker", &worker_domain, attempt_kind
+                    );
+                    return None;
+                }
                 Err(exc) => {
-                    crate::balancer::BALANCER.write().record_failure(
-                        dc, "cf_worker", &worker_domain
+                    crate::balancer::BALANCER.write().record_attempt_failure(
+                        dc, "cf_worker", &worker_domain, attempt_kind
                     );
                     self.report_failure_generation(&worker_domain, &exc, generation).await;
                 }
