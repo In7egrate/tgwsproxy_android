@@ -74,10 +74,9 @@ android {
         targetSdk = 35
         // Версия APK своя, не совпадает с версией ядра. Префикс «A» —
         // Android, дальше поколение обвязки и порядковый номер сборки.
-        // 203 is intentionally above the previous test build (202), so
-        // devices with that build can update to the first public 1.0.0 release.
-        versionCode = 203
-        versionName = "1.0.0"
+        // 204 is the first maintenance release after the public 1.0.0 build.
+        versionCode = 204
+        versionName = "1.0.1"
 
         ndk {
             // Ship the two ARM ABIs supported by the Rust cross-compilation setup.
