@@ -7,7 +7,7 @@ use crate::balancer::RouteObservation;
 use crate::{ldebug, linfo, lwarn};
 use once_cell::sync::Lazy;
 use byteorder::{ByteOrder, LittleEndian};
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -441,8 +441,11 @@ impl WsPool {
             }
             let count = failures.get(&slot).map(|(c, _)| *c).unwrap_or(0) + 1;
             let shift = (count - 1).min(12);
-            let delay = (WS_POOL_REFILL_BACKOFF_INITIAL * (2u64.pow(shift) as f64))
-                .min(WS_POOL_REFILL_BACKOFF_MAX);
+            let base_delay =
+                WS_POOL_REFILL_BACKOFF_INITIAL * (2u64.pow(shift) as f64);
+            let jitter = rand::thread_rng().gen_range(0.8..=1.2);
+            let delay = (base_delay * jitter)
+                .clamp(WS_POOL_REFILL_BACKOFF_INITIAL, WS_POOL_REFILL_BACKOFF_MAX);
             failures.insert(slot, (count, now_monotonic() + delay));
             drop(failures);
             linfo!(
