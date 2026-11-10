@@ -2864,25 +2864,29 @@ async fn serve_core<R, W>(
                     .get(dc, is_media, target.clone(), domains)
                     .await
                 {
-                    let pool_attempt = {
-                        crate::balancer::BALANCER
-                            .write()
-                            .begin_attempt(dc, "telegram_ws", &route)
-                    };
-                    if let Some(attempt_kind) = pool_attempt {
-                        STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
-                        pooled_observation = Some(RouteObservation {
-                            dc_id: dc,
-                            route_kind: "telegram_ws".to_string(),
-                            route,
-                            attempt_kind,
-                            connected_at: Instant::now(),
-                            generation: route_generation,
-                        });
-                        pooled_ws = Some(ws);
-                    } else {
+                    if crate::balancer::BALANCER.read().generation() != route_generation {
                         STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
                         ws.close().await;
+                        record_diagnostic("route_circuit_skip kind=telegram_ws stale_pool=1");
+                    } else {
+                        let pool_attempt = crate::balancer::BALANCER
+                            .write()
+                            .begin_attempt(dc, "telegram_ws", &route);
+                        if let Some(attempt_kind) = pool_attempt {
+                            STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
+                            pooled_observation = Some(RouteObservation {
+                                dc_id: dc,
+                                route_kind: "telegram_ws".to_string(),
+                                route,
+                                attempt_kind,
+                                connected_at: Instant::now(),
+                                generation: route_generation,
+                            });
+                            pooled_ws = Some(ws);
+                        } else {
+                            STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
+                            ws.close().await;
+                        }
                     }
                 }
             }
@@ -2951,26 +2955,30 @@ async fn serve_core<R, W>(
             .get(dc, is_media, target.clone(), domains.clone())
             .await
         {
-            let pool_attempt = {
-                crate::balancer::BALANCER
-                    .write()
-                    .begin_attempt(dc, "telegram_ws", &route)
-            };
-            if let Some(attempt_kind) = pool_attempt {
-                STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
-                route_observation = Some(RouteObservation {
-                    dc_id: dc,
-                    route_kind: "telegram_ws".to_string(),
-                    route,
-                    attempt_kind,
-                    connected_at: Instant::now(),
-                    generation: route_generation,
-                });
-                ws_opt = Some(ws);
-                linfo!("[{}] DC{}{} -> pool hit via {}", label, dc, m_tag, target);
-            } else {
+            if crate::balancer::BALANCER.read().generation() != route_generation {
                 STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
                 ws.close().await;
+                record_diagnostic("route_circuit_skip kind=telegram_ws stale_pool=1");
+            } else {
+                let pool_attempt = crate::balancer::BALANCER
+                    .write()
+                    .begin_attempt(dc, "telegram_ws", &route);
+                if let Some(attempt_kind) = pool_attempt {
+                    STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
+                    route_observation = Some(RouteObservation {
+                        dc_id: dc,
+                        route_kind: "telegram_ws".to_string(),
+                        route,
+                        attempt_kind,
+                        connected_at: Instant::now(),
+                        generation: route_generation,
+                    });
+                    ws_opt = Some(ws);
+                    linfo!("[{}] DC{}{} -> pool hit via {}", label, dc, m_tag, target);
+                } else {
+                    STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
+                    ws.close().await;
+                }
             }
         }
     }
