@@ -32,7 +32,7 @@ static DIRECT_WS_DIALS: Lazy<Arc<Semaphore>> =
     Lazy::new(|| Arc::new(Semaphore::new(4)));
 
 fn try_direct_ws_dial_slot() -> Option<OwnedSemaphorePermit> {
-    DIRECT_WS_DIALS.clone().try_acquire_owned().ok()
+    Arc::clone(&*DIRECT_WS_DIALS).try_acquire_owned().ok()
 }
 
 pub fn ws_pool_fronting_first() -> bool {
