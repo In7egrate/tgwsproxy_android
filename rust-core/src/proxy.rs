@@ -2067,8 +2067,8 @@ async fn try_cfproxy_base_domain(
         if let Some(stale_ws) = ws {
             stale_ws.close().await;
         }
-        crate::balancer::BALANCER.write().cancel_attempt(
-            dc, "cf_proxy", &base_domain, attempt_kind
+        crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+            route_generation, dc, "cf_proxy", &base_domain, attempt_kind
         );
         record_diagnostic("cf_connect_result_ignored reason=network_generation_changed");
         return (None, String::new(), None);
