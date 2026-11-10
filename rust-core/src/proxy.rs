@@ -1463,7 +1463,7 @@ pub async fn bridge_ws<R, W>(
     };
     let elapsed = now_monotonic() - start;
     if let Some(observation) = route_observation.as_ref() {
-        let requested_upstream = up_bytes.load(Ordering::Relaxed) > 0;
+        let requested_upstream = true; // relay_init was sent before entering bridge_ws.
         let received_downstream = down_bytes.load(Ordering::Relaxed) > 0;
         let client_closed_cleanly = close_reason == "normal"
             || close_reason.starts_with("client: tcp_eof")
@@ -1626,6 +1626,8 @@ pub async fn bridge_tcp<CR, CW>(
     let first_byte_recorded = Arc::new(AtomicBool::new(false));
     let first_byte_recorded_down = first_byte_recorded.clone();
     let route_observation_down = route_observation.clone();
+    let remote_failed = Arc::new(AtomicBool::new(false));
+    let remote_failed_down = remote_failed.clone();
     let down = async move {
         let mut buf = vec![0u8; 131072];
         loop {
@@ -1633,9 +1635,15 @@ pub async fn bridge_tcp<CR, CW>(
                 _ = cancel_token_down.cancelled() => break,
                 _ = cancel_down.cancelled() => break,
                 r = tokio::time::timeout(BRIDGE_READ_TIMEOUT, r_read.read(&mut buf)) => match r {
-                    Ok(Ok(0)) => break,
+                    Ok(Ok(0)) => {
+                        remote_failed_down.store(true, Ordering::Release);
+                        break;
+                    }
                     Ok(Ok(n)) => n,
-                    _ => break,
+                    _ => {
+                        remote_failed_down.store(true, Ordering::Release);
+                        break;
+                    }
                 },
             };
             if n > 0 {
@@ -1674,11 +1682,24 @@ pub async fn bridge_tcp<CR, CW>(
     session_cancel.cancel();
     if let Some(observation) = route_observation.as_ref() {
         if !first_byte_recorded.load(Ordering::Acquire) {
-            crate::balancer::BALANCER.write().release_validation(
-                observation.dc,
-                observation.kind,
-                &observation.route,
-            );
+            if remote_failed.load(Ordering::Acquire) {
+                crate::balancer::BALANCER.write().record_failure(
+                    observation.dc,
+                    observation.kind,
+                    &observation.route,
+                );
+                STATS.first_byte_failures.fetch_add(1, Ordering::Relaxed);
+                record_diagnostic(&format!(
+                    "route_first_byte_fail kind={} dc={} reason=remote_closed",
+                    observation.kind, observation.dc
+                ));
+            } else {
+                crate::balancer::BALANCER.write().release_validation(
+                    observation.dc,
+                    observation.kind,
+                    &observation.route,
+                );
+            }
         }
     }
     let _ = (clt_dec, clt_enc, tg_enc, tg_dec);
