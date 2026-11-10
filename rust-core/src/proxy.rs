@@ -932,7 +932,11 @@ impl CfWorkerPool {
         let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
         let query = format!("dst={}&dc={}", fallback_dst, dc);
         let path = format!("/apiws?{}", query);
-        for worker_domain in self.available_domains(dc, worker_domains).await {
+        let available = self.available_domains(dc, worker_domains).await;
+        let ordered = crate::balancer::BALANCER
+            .read()
+            .rank_candidates(dc, "cf_worker", &available);
+        for worker_domain in ordered {
             if self.generation.load(Ordering::Acquire) != generation {
                 return None;
             }
@@ -1778,6 +1782,13 @@ async fn try_cfproxy_base_domain(
         return (None, String::new(), None);
     }
 
+    let Some(ws) = ws else {
+        crate::balancer::BALANCER.write().record_attempt_failure(
+            dc, "cf_proxy", &base_domain, attempt_kind
+        );
+        record_diagnostic(&format!("cf_connect_fail dc={} reason=no_socket", dc));
+        return (None, String::new(), None);
+    };
     crate::balancer::BALANCER.write().record_connect_success(
         dc, "cf_proxy", &base_domain, started.elapsed(), attempt_kind
     );
@@ -1795,7 +1806,7 @@ async fn try_cfproxy_base_domain(
         attempt_kind,
         connected_at: started,
     };
-    (ws, base_domain, Some(observation))
+    (Some(ws), base_domain, Some(observation))
 }
 
 // Только устанавливает WS-соединение через CF, НЕ трогая conn.
