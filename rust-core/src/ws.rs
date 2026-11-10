@@ -995,7 +995,14 @@ pub async fn ws_connect_full_opts(
 
 // connectOneWS: перебор доменов (pool refill path, fronting-first как в оригинале)
 pub async fn connect_one_ws(ip: &str, domains: &[String]) -> Option<RawWebSocket> {
-    connect_one_ws_full(ip, domains, WS_PATH, WS_POOL_CONNECT_TIMEOUT).await
+    connect_one_ws_with_domain(ip, domains).await.map(|(ws, _)| ws)
+}
+
+pub async fn connect_one_ws_with_domain(
+    ip: &str,
+    domains: &[String],
+) -> Option<(RawWebSocket, String)> {
+    connect_one_ws_full_with_domain(ip, domains, WS_PATH, WS_POOL_CONNECT_TIMEOUT).await
 }
 
 pub async fn connect_one_ws_full(
@@ -1004,6 +1011,17 @@ pub async fn connect_one_ws_full(
     path: &str,
     timeout: f64,
 ) -> Option<RawWebSocket> {
+    connect_one_ws_full_with_domain(ip, domains, path, timeout)
+        .await
+        .map(|(ws, _)| ws)
+}
+
+pub async fn connect_one_ws_full_with_domain(
+    ip: &str,
+    domains: &[String],
+    path: &str,
+    timeout: f64,
+) -> Option<(RawWebSocket, String)> {
     // Try each Telegram hostname. When fronting-first is enabled, one
     // fronted attempt precedes the normal SNI attempt; do not repeat the same
     // fronted attempt after a timeout, and do not abandon the alternate host.
@@ -1011,29 +1029,27 @@ pub async fn connect_one_ws_full(
     for d in domains {
         if fronting_first {
             if let Some(ws) = connect_fronted(ip, d, path).await {
-                return Some(ws);
+                return Some((ws, d.clone()));
             }
         }
         match ws_connect_full_opts(ip, d, path, timeout, None, Some(true)).await {
             Ok(ws) => {
                 crate::proxy::set_ws_pool_fronting_first(false);
-                return Some(ws);
+                return Some((ws, d.clone()));
             }
             Err(WsError::Timeout) | Err(WsError::Io(_)) => {
                 if !fronting_first {
                     if let Some(ws) = connect_fronted(ip, d, path).await {
-                        return Some(ws);
+                        return Some((ws, d.clone()));
                     }
                 }
-                // Continue with the alternate Telegram hostname.
             }
             Err(WsError::Handshake(h)) => {
                 if !h.is_redirect() {
                     ldebug!("WS pool handshake rejected for {}: {}", d, h.status_line);
                 }
-                continue;
             }
-            Err(_) => continue,
+            Err(_) => {}
         }
     }
     None
