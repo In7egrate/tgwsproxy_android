@@ -3,7 +3,7 @@ use crate::config::*;
 use crate::crypto::*;
 use crate::faketls;
 use crate::ws::*;
-use crate::balancer::RouteObservation;
+use crate::balancer::{RouteAttemptKind, RouteObservation};
 use crate::{ldebug, linfo, lwarn};
 use once_cell::sync::Lazy;
 use byteorder::{ByteOrder, LittleEndian};
