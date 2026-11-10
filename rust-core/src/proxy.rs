@@ -3298,6 +3298,7 @@ pub async fn connect_direct_ws(
     let mut all_redirects = true;
 
     for dom in &candidates {
+        let route_generation = crate::balancer::BALANCER.read().generation();
         let attempt_kind = match crate::balancer::BALANCER
             .write()
             .begin_attempt(dc, "telegram_ws", dom)
@@ -3330,6 +3331,16 @@ pub async fn connect_direct_ws(
             }
             result = ws_connect_full_opts(target, dom, ws_path, timeout, None, None) => result,
         };
+        if crate::balancer::BALANCER.read().generation() != route_generation {
+            if let Ok(stale_ws) = attempt {
+                stale_ws.close().await;
+            }
+            crate::balancer::BALANCER.write().cancel_attempt(
+                dc, "telegram_ws", dom, attempt_kind
+            );
+            record_diagnostic("ws_direct_retry_ignored reason=network_generation_changed");
+            return (None, ws_failed_redirect, false, None);
+        }
         match &attempt {
             Ok(_) => crate::balancer::BALANCER.write().record_connect_success(
                 dc, "telegram_ws", dom, started.elapsed(), attempt_kind
@@ -3349,6 +3360,7 @@ pub async fn connect_direct_ws(
                     route: dom.clone(),
                     attempt_kind,
                     connected_at: started,
+                    generation: route_generation,
                 };
                 return (Some(ws), ws_failed_redirect, false, Some(observation));
             }
