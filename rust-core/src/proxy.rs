@@ -550,8 +550,8 @@ impl WsPool {
                     if self.generation.load(Ordering::Acquire) != generation
                         || crate::balancer::BALANCER.read().generation() != route_generation
                     {
-                        crate::balancer::BALANCER.write().cancel_attempt(
-                            dc, "telegram_ws", &domain, attempt_kind
+                        crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                            route_generation, dc, "telegram_ws", &domain, attempt_kind
                         );
                         ws.close().await;
                         return None;
@@ -571,8 +571,8 @@ impl WsPool {
                     if self.generation.load(Ordering::Acquire) != generation
                         || crate::balancer::BALANCER.read().generation() != route_generation
                     {
-                        crate::balancer::BALANCER.write().cancel_attempt(
-                            dc, "telegram_ws", &domain, attempt_kind
+                        crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                            route_generation, dc, "telegram_ws", &domain, attempt_kind
                         );
                         return None;
                     }
@@ -3373,8 +3373,8 @@ pub async fn connect_direct_ws(
             Ok(_) => crate::balancer::BALANCER.write().record_connect_success_for_generation(
                 route_generation, dc, "telegram_ws", dom, started.elapsed(), attempt_kind
             ),
-            Err(WsError::Canceled) => crate::balancer::BALANCER.write().cancel_attempt(
-                dc, "telegram_ws", dom, attempt_kind
+            Err(WsError::Canceled) => crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                route_generation, dc, "telegram_ws", dom, attempt_kind
             ),
             Err(_) => crate::balancer::BALANCER.write().record_attempt_failure_for_generation(
                 route_generation, dc, "telegram_ws", dom, attempt_kind
