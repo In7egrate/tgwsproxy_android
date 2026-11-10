@@ -2037,7 +2037,8 @@ where
     // Шаг 2: cf-ws (без halves).
     if use_cf {
         record_diagnostic(&format!("route_attempt kind=cf_proxy dc={} media={}", dc, is_media as u8));
-        if let Some((ws, _chosen_domain)) =
+        let route_started = Instant::now();
+        if let Some((ws, chosen_domain)) =
             cfproxy_acquire_ws(dc, is_media, ws_path, &cancel_token).await
         {
             STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
@@ -2056,13 +2057,20 @@ where
                     clt_enc.clone_state(),
                     tg_enc.clone_state(),
                     tg_dec.clone_state(),
+                    Some(RouteObservation {
+                        dc,
+                        kind: "cf_proxy",
+                        route: chosen_domain,
+                        started: route_started,
+                    }),
                     cancel_token,
                 )
                 .await;
                 return true;
             }
+            crate::balancer::BALANCER.write().record_failure(dc, "cf_proxy", &chosen_domain);
             ws.close().await;
-            // CF умер сразу после хендшейка — пробуем TCP на том же conn.
+            // CF умер сразу после handshake — пробуем TCP на том же conn.
         }
         // CF не дал ws — halves НЕ тронуты, идём в TCP fallback ниже.
     }
