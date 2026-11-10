@@ -139,6 +139,7 @@ pub struct DcSlot {
 pub struct PoolEntry {
     pub ws: RawWebSocket,
     pub route: String,
+    pub route_generation: u64,
     pub created: f64, // monotonic, как time.monotonic() в оригинале
     // Permit bounds the total number of idle pooled sockets across all DC/media slots.
     _budget_permit: OwnedSemaphorePermit,
@@ -220,7 +221,7 @@ impl WsPool {
         is_media: bool,
         target_ip: String,
         domains: Vec<String>,
-    ) -> Option<(RawWebSocket, String)> {
+    ) -> Option<(RawWebSocket, String, u64)> {
         let slot = DcSlot {
             dc,
             is_media: is_media_int(is_media),
@@ -240,7 +241,7 @@ impl WsPool {
         }
         let now = now_monotonic();
 
-        let mut ws: Option<(RawWebSocket, String)> = None;
+        let mut ws: Option<(RawWebSocket, String, u64)> = None;
         let mut stale_sockets = Vec::new();
         {
             let mut q = state.queue.lock().await;
@@ -257,7 +258,7 @@ impl WsPool {
                     age,
                     q.len()
                 );
-                ws = Some((entry.ws, entry.route));
+                ws = Some((entry.ws, entry.route, entry.route_generation));
                 break;
             }
         }
@@ -268,7 +269,7 @@ impl WsPool {
         while closing.join_next().await.is_some() {}
 
         if self.generation.load(Ordering::Acquire) != generation {
-            if let Some((socket, _route)) = ws.take() {
+            if let Some((socket, _route, _route_generation)) = ws.take() {
                 socket.close().await;
             }
             return None;
@@ -388,15 +389,15 @@ impl WsPool {
                 let socket = pool
                     .connect_one_route(slot.dc, &target_ip, &domains, &cancel, generation)
                     .await;
-                socket.map(|(ws, route)| (ws, route, permit))
+                socket.map(|(ws, route, route_generation)| (ws, route, route_generation, permit))
             });
         }
 
         let mut connected = 0;
         // Completion-order handling: a slow TLS attempt cannot hold ready media sockets.
         while let Some(result) = handles.join_next().await {
-            if let Ok(Some((ws, route, permit))) = result {
-                let mut candidate = Some((ws, route, permit));
+            if let Ok(Some((ws, route, route_generation, permit))) = result {
+                let mut candidate = Some((ws, route, route_generation, permit));
                 {
                     // Lock order matches reset/close_all. If reset advances the
                     // generation while this lock is held, reset drains this entry
@@ -407,11 +408,12 @@ impl WsPool {
                     if is_current {
                         let mut queue = state.queue.lock().await;
                         if queue.len() < 16 {
-                            let (ws, route, budget_permit) =
+                            let (ws, route, route_generation, budget_permit) =
                                 candidate.take().expect("candidate socket is present");
                             queue.push_back(PoolEntry {
                                 ws,
                                 route,
+                                route_generation,
                                 created: now_monotonic(),
                                 _budget_permit: budget_permit,
                             });
@@ -419,7 +421,7 @@ impl WsPool {
                         }
                     }
                 }
-                if let Some((socket, _route, budget_permit)) = candidate {
+                if let Some((socket, _route, _route_generation, budget_permit)) = candidate {
                     socket.close().await;
                     drop(budget_permit);
                 }
@@ -469,7 +471,7 @@ impl WsPool {
         domains: &[String],
         cancel: &CancellationToken,
         generation: u64,
-    ) -> Option<(RawWebSocket, String)> {
+    ) -> Option<(RawWebSocket, String, u64)> {
         let candidates = crate::balancer::BALANCER
             .read()
             .rank_candidates(dc, "telegram_ws", domains);
@@ -560,7 +562,7 @@ impl WsPool {
                     crate::balancer::BALANCER.write().record_connect_success(
                         dc, "telegram_ws", &domain, started.elapsed(), attempt_kind
                     );
-                    return Some((ws, domain));
+                    return Some((ws, domain, route_generation));
                 }
                 Err(WsError::Canceled) => {
                     crate::balancer::BALANCER.write().cancel_attempt(
