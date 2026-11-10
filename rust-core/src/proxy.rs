@@ -2025,6 +2025,7 @@ async fn try_cfproxy_base_domain(
             None => return (None, String::new(), None),
         },
     };
+    let route_generation = crate::balancer::BALANCER.read().generation();
     let attempt_kind = match crate::balancer::BALANCER
         .write()
         .begin_attempt(dc, "cf_proxy", &base_domain)
@@ -2053,6 +2054,16 @@ async fn try_cfproxy_base_domain(
         result = cf_connect_domain(&domain, ws_path, 5.0) => result,
     };
     let (ws, resolved_ip, err) = result;
+    if crate::balancer::BALANCER.read().generation() != route_generation {
+        if let Some(stale_ws) = ws {
+            stale_ws.close().await;
+        }
+        crate::balancer::BALANCER.write().cancel_attempt(
+            dc, "cf_proxy", &base_domain, attempt_kind
+        );
+        record_diagnostic("cf_connect_result_ignored reason=network_generation_changed");
+        return (None, String::new(), None);
+    }
     if let Some(e) = err {
         if matches!(e, WsError::Canceled) {
             crate::balancer::BALANCER.write().cancel_attempt(
@@ -2108,6 +2119,7 @@ async fn try_cfproxy_base_domain(
         route: base_domain.clone(),
         attempt_kind,
         connected_at: started,
+        generation: route_generation,
     };
     (Some(ws), base_domain, Some(observation))
 }
