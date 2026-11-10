@@ -95,7 +95,7 @@ object GithubUpdateManager {
             // GitHub tags are not guaranteed to be exactly "v1.2.3": some
             // projects use prefixes such as "release-1.2.3". Find the first
             // numeric SemVer-like sequence instead of discarding that tag.
-            val match = Regex("""(\\d+(?:\\.\\d+)*)(?:-([0-9A-Za-z][0-9A-Za-z.-]*))?""")
+            val match = Regex("""(\d+(?:\.\d+)*)(?:-([0-9A-Za-z][0-9A-Za-z.-]*))?""")
                 .find(value.trim())
                 ?: return ParsedVersion(emptyList(), null)
             val core = match.groupValues[1].split('.').mapNotNull { it.toLongOrNull() }
