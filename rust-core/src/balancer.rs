@@ -1,6 +1,7 @@
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
+use rand::Rng;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -362,11 +363,14 @@ impl Balancer {
                 .saturating_sub(CIRCUIT_FAILURE_THRESHOLD)
                 .min(5);
             let multiplier = 1u64.checked_shl(shift).unwrap_or(32);
-            let seconds = CIRCUIT_BASE_COOLDOWN
+            let base_seconds = CIRCUIT_BASE_COOLDOWN
                 .as_secs()
-                .saturating_mul(multiplier)
-                .min(MAX_FAILURE_COOLDOWN.as_secs());
-            metric.cooldown_until = Some(Instant::now() + Duration::from_secs(seconds));
+                .saturating_mul(multiplier) as f64;
+            let jitter = rand::thread_rng().gen_range(0.8..=1.2);
+            let seconds = (base_seconds * jitter)
+                .clamp(1.0, MAX_FAILURE_COOLDOWN.as_secs() as f64);
+            metric.cooldown_until =
+                Some(Instant::now() + Duration::from_secs_f64(seconds));
         }
     }
 
