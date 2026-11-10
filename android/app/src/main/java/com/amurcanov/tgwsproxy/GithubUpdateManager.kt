@@ -89,28 +89,57 @@ object GithubUpdateManager {
     }
 
     internal fun compareVersionStrings(remote: String, local: String): Int {
-        fun core(value: String): List<Long> {
-            val normalized = value.trim().removePrefix("v").removePrefix("V")
-                .substringBefore('+').substringBefore('-')
-            return Regex("\\d+").findAll(normalized).mapNotNull { it.value.toLongOrNull() }.toList()
+        data class ParsedVersion(val core: List<Long>, val prerelease: String?)
+
+        fun parse(value: String): ParsedVersion {
+            // GitHub tags are not guaranteed to be exactly "v1.2.3": some
+            // projects use prefixes such as "release-1.2.3". Find the first
+            // numeric SemVer-like sequence instead of discarding that tag.
+            val match = Regex("""(\\d+(?:\\.\\d+)*)(?:-([0-9A-Za-z][0-9A-Za-z.-]*))?""")
+                .find(value.trim())
+                ?: return ParsedVersion(emptyList(), null)
+            val core = match.groupValues[1].split('.').mapNotNull { it.toLongOrNull() }
+            val prerelease = match.groupValues[2].takeIf { it.isNotEmpty() }
+            return ParsedVersion(core, prerelease)
         }
-        fun prerelease(value: String): String? {
-            val normalized = value.trim().removePrefix("v").removePrefix("V").substringBefore('+')
-            return normalized.substringAfter('-', "").takeIf { it.isNotEmpty() }
+
+        fun comparePrerelease(a: String, b: String): Int {
+            val left = a.split('.', '-')
+            val right = b.split('.', '-')
+            for (index in 0 until maxOf(left.size, right.size)) {
+                if (index >= left.size) return -1
+                if (index >= right.size) return 1
+                val x = left[index]
+                val y = right[index]
+                val xn = x.toLongOrNull()
+                val yn = y.toLongOrNull()
+                val compared = when {
+                    xn != null && yn != null -> xn.compareTo(yn)
+                    xn != null -> -1
+                    yn != null -> 1
+                    else -> x.compareTo(y)
+                }
+                if (compared != 0) return compared
+            }
+            return 0
         }
-        val remoteParts = core(remote)
-        val localParts = core(local)
-        val size = maxOf(remoteParts.size, localParts.size)
-        for (index in 0 until size) {
-            val a = remoteParts.getOrElse(index) { 0L }
-            val b = localParts.getOrElse(index) { 0L }
+
+        val remoteVersion = parse(remote)
+        val localVersion = parse(local)
+        for (index in 0 until maxOf(remoteVersion.core.size, localVersion.core.size)) {
+            val a = remoteVersion.core.getOrElse(index) { 0L }
+            val b = localVersion.core.getOrElse(index) { 0L }
             if (a != b) return a.compareTo(b)
         }
-        val remotePre = prerelease(remote)
-        val localPre = prerelease(local)
+
+        val remotePre = remoteVersion.prerelease
+        val localPre = localVersion.prerelease
         if (remotePre == null && localPre != null) return 1
         if (remotePre != null && localPre == null) return -1
-        return (remotePre ?: "").compareTo(localPre ?: "")
+        if (remotePre != null && localPre != null) {
+            return comparePrerelease(remotePre, localPre)
+        }
+        return 0
     }
 
     private fun selectApkAsset(assets: List<JSONObject>): JSONObject? {
