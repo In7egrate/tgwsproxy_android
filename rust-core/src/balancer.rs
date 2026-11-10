@@ -402,15 +402,17 @@ impl Balancer {
             return OPEN_CIRCUIT_SCORE;
         }
 
-        let latency = if metric.first_byte_samples > 0 {
+        let latency_score = if metric.first_byte_samples > 0 {
             metric.first_byte_latency_ewma_ms
         } else if metric.connect_samples > 0 {
-            metric.connect_latency_ewma_ms
+            // A fast handshake without any successful application response
+            // is not a healthy route. Keep it behind routes with real probes.
+            UNKNOWN_ROUTE_SCORE + metric.connect_latency_ewma_ms
         } else {
             UNKNOWN_ROUTE_SCORE
         };
         let reliability_penalty = 1.0 + FAILURE_PENALTY * (1.0 - metric.success_ewma);
-        latency * reliability_penalty
+        latency_score * reliability_penalty
     }
 
     pub fn metrics_snapshot(&self) -> Vec<serde_json::Value> {
@@ -434,6 +436,13 @@ impl Balancer {
                 } else {
                     "closed"
                 };
+                let latency_source = if metric.first_byte_samples > 0 {
+                    "first_byte"
+                } else if metric.connect_samples > 0 {
+                    "connect_only"
+                } else {
+                    "unknown"
+                };
                 serde_json::json!({
                     "dc": dc,
                     "kind": kind,
@@ -448,6 +457,7 @@ impl Balancer {
                     } else {
                         metric.connect_latency_ewma_ms.round() as u64
                     },
+                    "latency_source": latency_source,
                     "success_rate_permille": (metric.success_ewma * 1000.0).round() as u16,
                     "circuit_state": circuit_state,
                     "cooldown_remaining_ms": cooldown_remaining_ms,
