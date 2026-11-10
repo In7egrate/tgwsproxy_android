@@ -283,7 +283,7 @@ impl WsPool {
             while let Some(entry) = q.pop_front() {
                 let age = now - entry.created;
                 if age > WS_POOL_REUSE_MAX_AGE || entry.ws.is_closed() {
-                    stale_sockets.push(entry.ws);
+                    stale_sockets.push((entry.ws, entry.route));
                     continue;
                 }
                 ldebug!(
@@ -298,7 +298,8 @@ impl WsPool {
             }
         }
         let mut closing = JoinSet::new();
-        for socket in stale_sockets {
+        for (socket, route) in stale_sockets {
+            crate::balancer::BALANCER.write().release_validation(dc, "telegram_ws", &route);
             closing.spawn(async move { socket.close().await; });
         }
         while closing.join_next().await.is_some() {}
@@ -809,7 +810,7 @@ impl CfWorkerPool {
                     || now - e.created > CF_WORKER_POOL_MAX_AGE
                     || e.ws.is_closed()
                 {
-                    stale.push(e.ws);
+                    stale.push((e.ws, e.worker_domain));
                     continue;
                 }
                 hit = Some(e);
@@ -817,7 +818,8 @@ impl CfWorkerPool {
             }
             (hit, stale)
         };
-        for socket in stale_sockets {
+        for (socket, route) in stale_sockets {
+            crate::balancer::BALANCER.write().release_validation(dc, "cf_worker", &route);
             socket.close().await;
         }
         let mut result = match entry {
@@ -842,8 +844,9 @@ impl CfWorkerPool {
         };
 
         if self.generation.load(Ordering::Acquire) != generation {
-            if let Some((socket, _)) = result.take() {
+            if let Some((socket, route)) = result.take() {
                 socket.close().await;
+                crate::balancer::BALANCER.write().release_validation(dc, "cf_worker", &route);
             }
             return None;
         }
