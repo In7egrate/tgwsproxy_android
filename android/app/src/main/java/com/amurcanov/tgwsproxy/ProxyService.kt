@@ -11,7 +11,10 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.LinkProperties
 import android.net.NetworkRequest
+import java.net.Inet4Address
+import java.net.Inet6Address
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -71,6 +74,8 @@ class ProxyService : Service() {
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var defaultNetwork: Network? = null
     private var lastNetworkFingerprint: String? = null
+    private var lastRouteFingerprint: String? = null
+    private var lastLinkFingerprint: String? = null
     private var lastWakeLockAcquire = 0L
     private var lastTunnelAttempt = 0L
     private var serviceStartAttempts = 0
@@ -184,7 +189,7 @@ class ProxyService : Service() {
                 val err = json.optString("error").ifEmpty { state }
                 DiagnosticStore.record(
                     this,
-                    "service_start_failed state=${state.take(80)} error=${err.take(120)} attempt=$serviceStartAttempts elapsed_ms=${android.os.SystemClock.elapsedRealtime() - startStartedAt}",
+                    "service_start_failed state=${state.take(40)} error_class=${classifyStartError(err, state)} attempt=$serviceStartAttempts elapsed_ms=${android.os.SystemClock.elapsedRealtime() - startStartedAt}",
                 )
                 Log.e(TAG, "Прокси не запустился: $err")
                 releaseWakeLock()
@@ -267,6 +272,15 @@ class ProxyService : Service() {
                 defaultNetwork = network
                 updateNetworkState(network, "capabilities", caps)
             }
+
+            override fun onLinkPropertiesChanged(
+                network: Network,
+                linkProperties: LinkProperties,
+            ) {
+                if (defaultNetwork != null && defaultNetwork != network) return
+                defaultNetwork = network
+                updateLinkProperties(network, linkProperties)
+            }
         }
         netCallback = cb
         try {
@@ -274,6 +288,9 @@ class ProxyService : Service() {
             val active = cm.activeNetwork
             defaultNetwork = active
             updateNetworkState(active, "initial")
+            if (active != null) {
+                cm.getLinkProperties(active)?.let { updateLinkProperties(active, it) }
+            }
         } catch (t: Throwable) {
             Log.w(TAG, "Не удалось подписаться на смену сети", t)
             netCallback = null
@@ -329,15 +346,20 @@ class ProxyService : Service() {
             if (vpn) append(" underlying=not_exposed")
         }
 
-        // Network.hashCode is used only in-memory to distinguish two different
-        // networks with the same transport; the identifier itself is not logged.
-        val fingerprint = "${network?.hashCode() ?: -1}|$descriptor"
-        if (fingerprint == lastNetworkFingerprint) return
-        lastNetworkFingerprint = fingerprint
+        // Keep the full capability fingerprint for diagnostics, but reset
+        // route pools only when the default Network or its transport/VPN path
+        // changes. Validation and metering updates alone do not kill sockets.
+        val networkKey = network?.hashCode() ?: -1
+        val routeFingerprint = "$networkKey|$transport|vpn=${if (vpn) 1 else 0}"
+        val diagnosticFingerprint = "$routeFingerprint|internet=$internet|validated=$validated|metered=$metered|not_roaming=$notRoaming"
+        if (diagnosticFingerprint == lastNetworkFingerprint) return
+        val routeChanged = routeFingerprint != lastRouteFingerprint
+        lastNetworkFingerprint = diagnosticFingerprint
+        lastRouteFingerprint = routeFingerprint
 
-        DiagnosticStore.record(this, "network_event=$reason $descriptor")
+        DiagnosticStore.record(this, "network_event=$reason $descriptor route_changed=${if (routeChanged) 1 else 0}")
         Log.i(TAG, "Network changed: $reason $descriptor")
-        if (isRunning) {
+        if (isRunning && routeChanged) {
             workerHandler?.post {
                 runCatching { RustBridge.onNetworkChange("$reason $descriptor") }
                     .onFailure {
@@ -347,6 +369,50 @@ class ProxyService : Service() {
                         )
                     }
             }
+        }
+    }
+
+    /**
+     * LinkProperties may change during a cellular handover even when Android
+     * keeps the same Network object. Export only shape/count metadata, never
+     * addresses, DNS values, interface names, or proxy details.
+     */
+    private fun updateLinkProperties(network: Network, properties: LinkProperties) {
+        val ipv4 = properties.linkAddresses.count { it.address is Inet4Address }
+        val ipv6 = properties.linkAddresses.count { it.address is Inet6Address }
+        val defaultRoutes = properties.routes.count { it.isDefaultRoute }
+        val routeCount = properties.routes.size
+        val dnsCount = properties.dnsServers.size
+        val summary = "ipv4=$ipv4 ipv6=$ipv6 default_routes=$defaultRoutes routes=$routeCount dns_count=$dnsCount mtu=${properties.mtu}"
+        val networkKey = network.hashCode().toString()
+        val fingerprint = "$networkKey|$ipv4|$ipv6|$defaultRoutes|$routeCount|$dnsCount|${properties.mtu}"
+        val previous = lastLinkFingerprint
+        if (fingerprint == previous) return
+        lastLinkFingerprint = fingerprint
+        DiagnosticStore.record(this, "network_link_properties $summary")
+        val changedOnSameNetwork = previous != null &&
+            previous.substringBefore('|') == networkKey
+        if (isRunning && changedOnSameNetwork) {
+            workerHandler?.post {
+                runCatching { RustBridge.onNetworkChange("link_properties_changed") }
+                    .onFailure {
+                        DiagnosticStore.record(
+                            this,
+                            "network_handover_reset_failed type=${it.javaClass.simpleName}",
+                        )
+                    }
+            }
+        }
+    }
+
+    private fun classifyStartError(error: String, state: String): String {
+        val value = "$state $error".lowercase()
+        return when {
+            "address already in use" in value || "eaddrinuse" in value || "bind" in value -> "bind"
+            "permission" in value || "denied" in value -> "permission"
+            "native library" in value || "unsatisfiedlink" in value -> "native_library"
+            "secret" in value || "configuration" in value || "invalid config" in value -> "configuration"
+            else -> "native_start_failed"
         }
     }
 
