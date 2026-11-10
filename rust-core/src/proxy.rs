@@ -1730,8 +1730,12 @@ async fn try_cfproxy_base_domain(
         .write()
         .begin_attempt(dc, "cf_proxy", &base_domain)
     {
-        Some(kind) => kind,
+        Some(kind) => {
+            STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
+            kind
+        }
         None => {
+            STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
             record_diagnostic("route_circuit_skip kind=cf_proxy");
             return (None, String::new(), None);
         }
@@ -2015,8 +2019,14 @@ where
                     .write()
                     .begin_attempt(dc, "cf_worker", &worker_domain)
                 {
-                    Some(kind) => kind,
-                    None => continue,
+                    Some(kind) => {
+                        STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
+                        kind
+                    }
+                    None => {
+                        STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                 };
                 let _dial_permit = match try_direct_ws_dial_slot() {
                     Some(permit) => permit,
@@ -2605,8 +2615,12 @@ async fn serve_core<R, W>(
                 .write()
                 .begin_attempt(dc, "telegram_ws", domain)
             {
-                Some(kind) => kind,
+                Some(kind) => {
+                    STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
+                    kind
+                }
                 None => {
+                    STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
                     record_diagnostic(&format!(
                         "route_circuit_skip dc={} kind=telegram_ws",
                         dc
@@ -2904,8 +2918,14 @@ pub async fn connect_direct_ws(
             .write()
             .begin_attempt(dc, "telegram_ws", dom)
         {
-            Some(kind) => kind,
-            None => continue,
+            Some(kind) => {
+                STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
+                kind
+            }
+            None => {
+                STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         };
         let _dial_permit = match try_direct_ws_dial_slot() {
             Some(permit) => permit,
