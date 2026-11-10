@@ -2319,8 +2319,13 @@ where
             .get(dc, fallback_dst.clone(), worker_domains.clone())
             .await;
         let mut worker_observation: Option<RouteObservation> = None;
-        let worker_ws = if let Some((ws, worker_domain)) = pooled {
-            let route_generation = crate::balancer::BALANCER.read().generation();
+        let worker_ws = if let Some((ws, worker_domain, route_generation)) = pooled {
+            if crate::balancer::BALANCER.read().generation() != route_generation {
+                ws.close().await;
+                STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
+                record_diagnostic("route_circuit_skip kind=cf_worker stale_pool=1");
+                None
+            } else {
             let attempt_kind = crate::balancer::BALANCER
                 .write()
                 .begin_attempt(dc, "cf_worker", &worker_domain);
@@ -2344,6 +2349,7 @@ where
                 ws.close().await;
                 record_diagnostic("route_circuit_skip kind=cf_worker pool=1");
                 None
+            }
             }
         } else {
             let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
@@ -2853,12 +2859,11 @@ async fn serve_core<R, W>(
             // Шанс пулу при случайном таймауте: пробуем забрать готовый WS.
             if !is_test_dc {
                 let domains = ws_domains(dc, is_media);
-                if let Some((ws, route)) = pools
+                if let Some((ws, route, route_generation)) = pools
                     .ws
                     .get(dc, is_media, target.clone(), domains)
                     .await
                 {
-                    let route_generation = crate::balancer::BALANCER.read().generation();
                     let pool_attempt = {
                         crate::balancer::BALANCER
                             .write()
@@ -2941,12 +2946,11 @@ async fn serve_core<R, W>(
     let mut all_redirects = true;
 
     if ws_opt.is_none() && !is_test_dc {
-        if let Some((ws, route)) = pools
+        if let Some((ws, route, route_generation)) = pools
             .ws
             .get(dc, is_media, target.clone(), domains.clone())
             .await
         {
-            let route_generation = crate::balancer::BALANCER.read().generation();
             let pool_attempt = {
                 crate::balancer::BALANCER
                     .write()
