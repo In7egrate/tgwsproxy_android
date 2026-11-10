@@ -2469,6 +2469,7 @@ async fn serve_core<R, W>(
     // Fallback если DC нет в конфиге, WS в чёрном списке или IP на cooldown —
     // порт ветки из _handle_client оригинала.
     let mut pooled_ws: Option<RawWebSocket> = None;
+    let mut pooled_observation: Option<RouteObservation> = None;
     let mut use_pooled_direct = false;
     if !dc_configured || blacklisted || (ip_cooldown_active && is_any_cf_fallback) {
         if !dc_configured {
@@ -2479,10 +2480,27 @@ async fn serve_core<R, W>(
             // Шанс пулу при случайном таймауте: пробуем забрать готовый WS.
             if !is_test_dc {
                 let domains = ws_domains(dc, is_media);
-                pooled_ws = pools
+                if let Some((ws, route)) = pools
                     .ws
                     .get(dc, is_media, target.clone(), domains)
-                    .await;
+                    .await
+                {
+                    if let Some(attempt_kind) = crate::balancer::BALANCER
+                        .write()
+                        .begin_attempt(dc, "telegram_ws", &route)
+                    {
+                        pooled_observation = Some(RouteObservation {
+                            dc_id: dc,
+                            route_kind: "telegram_ws".to_string(),
+                            route,
+                            attempt_kind,
+                            connected_at: Instant::now(),
+                        });
+                        pooled_ws = Some(ws);
+                    } else {
+                        ws.close().await;
+                    }
+                }
             }
             if pooled_ws.is_none() {
                 linfo!(
@@ -2537,19 +2555,34 @@ async fn serve_core<R, W>(
         .rank_candidates(dc, "telegram_ws", &direct_candidates);
     // pooled_ws уже может держать WS из cooldown-ветки.
     let mut ws_opt = pooled_ws;
-    let mut route_observation: Option<RouteObservation> = None;
+    let mut route_observation: Option<RouteObservation> = pooled_observation;
     let mut ws_failed_redirect = false;
     let mut ws_timed_out = false;
     let mut all_ws_attempts_timed_out = true;
     let mut all_redirects = true;
 
     if ws_opt.is_none() && !is_test_dc {
-        ws_opt = pools
+        if let Some((ws, route)) = pools
             .ws
             .get(dc, is_media, target.clone(), domains.clone())
-            .await;
-        if ws_opt.is_some() {
-            linfo!("[{}] DC{}{} -> pool hit via {}", label, dc, m_tag, target);
+            .await
+        {
+            if let Some(attempt_kind) = crate::balancer::BALANCER
+                .write()
+                .begin_attempt(dc, "telegram_ws", &route)
+            {
+                route_observation = Some(RouteObservation {
+                    dc_id: dc,
+                    route_kind: "telegram_ws".to_string(),
+                    route,
+                    attempt_kind,
+                    connected_at: Instant::now(),
+                });
+                ws_opt = Some(ws);
+                linfo!("[{}] DC{}{} -> pool hit via {}", label, dc, m_tag, target);
+            } else {
+                ws.close().await;
+            }
         }
     }
 
