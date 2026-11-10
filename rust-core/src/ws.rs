@@ -1031,7 +1031,7 @@ pub async fn connect_one_ws_full(
                 return Some((ws, domain.clone()));
             }
             Err(error) => {
-                let retry_fronted = matches!(error, WsError::Timeout | WsError::Io(_));
+                let retry_fronted = matches!(&error, WsError::Timeout | WsError::Io(_));
                 if retry_fronted && !fronting_first {
                     if let Some(ws) = connect_fronted(ip, domain, path).await {
                         return Some((ws, domain.clone()));
