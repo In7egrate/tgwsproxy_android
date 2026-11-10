@@ -22,6 +22,15 @@ pub enum RouteAttemptKind {
 }
 
 #[derive(Clone, Debug)]
+pub struct RouteObservation {
+    pub dc_id: i32,
+    pub route_kind: String,
+    pub route: String,
+    pub attempt_kind: RouteAttemptKind,
+    pub connected_at: Instant,
+}
+
+#[derive(Clone, Debug)]
 struct RouteMetric {
     connect_latency_ewma_ms: f64,
     first_byte_latency_ewma_ms: f64,
