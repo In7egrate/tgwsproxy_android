@@ -46,6 +46,7 @@ object DiagnosticStore {
             appendLine("created_elapsed_ms=${SystemClock.elapsedRealtime()}")
             appendLine("app_package=${context.packageName}")
             appendLine("app_version=$version")
+            appendLine("app_version_code=${BuildConfig.VERSION_CODE}")
             appendLine("android_release=${Build.VERSION.RELEASE}")
             appendLine("android_api=${Build.VERSION.SDK_INT}")
             appendLine("device=${safe(Build.MANUFACTURER)} ${safe(Build.MODEL)}")
