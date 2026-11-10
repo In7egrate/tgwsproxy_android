@@ -1765,7 +1765,7 @@ async fn try_cfproxy_base_domain(
             WsError::Other(_) => "other",
         };
         record_diagnostic(&format!("cf_connect_fail dc={} reason={}", dc, reason));
-        if matches!(e, WsError::Canceled) {
+        if matches!(&e, WsError::Canceled) {
             crate::balancer::BALANCER.write().release_attempt(dc, "cf_proxy", &base_domain);
         } else {
             crate::balancer::BALANCER.write().record_failure(dc, "cf_proxy", &base_domain);
