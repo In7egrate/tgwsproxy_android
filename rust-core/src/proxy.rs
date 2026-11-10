@@ -1158,6 +1158,7 @@ pub async fn bridge_ws<R, W>(
     let session_id = NEXT_WS_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let ws = Arc::new(ws);
     let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
+    let route_for_ping = route_observation.clone();
     let route_observation = Arc::new(Mutex::new(route_observation));
     let first_request_at = Arc::new(Mutex::new(None::<Instant>));
     let first_request_notify = Arc::new(Notify::new());
@@ -1190,9 +1191,19 @@ pub async fn bridge_ws<R, W>(
                     let idle = la_ping.lock().await.elapsed();
                     if idle > BRIDGE_PING_INTERVAL {
                         match ws_ping.send_ping().await {
-                            Ok(rtt) => record_diagnostic(&format!(
-                                "ws_ping_ok session={} rtt_ms={}", session_id, rtt.as_millis()
-                            )),
+                            Ok(rtt) => {
+                                if let Some(observation) = route_for_ping.as_ref() {
+                                    crate::balancer::BALANCER.write().record_ping_success(
+                                        observation.dc_id,
+                                        &observation.route_kind,
+                                        &observation.route,
+                                        rtt,
+                                    );
+                                }
+                                record_diagnostic(&format!(
+                                    "ws_ping_ok session={} rtt_ms={}", session_id, rtt.as_millis()
+                                ));
+                            }
                             Err(error) => {
                                 let reason = match &error {
                                     WsError::Timeout => "timeout",
@@ -1205,6 +1216,16 @@ pub async fn bridge_ws<R, W>(
                                 record_diagnostic(&format!(
                                     "ws_ping_fail session={} reason={}", session_id, reason
                                 ));
+                                if !matches!(&error, WsError::Canceled) {
+                                    if let Some(observation) = route_for_ping.as_ref() {
+                                        STATS.route_early_failures.fetch_add(1, Ordering::Relaxed);
+                                        crate::balancer::BALANCER.write().record_ping_failure(
+                                            observation.dc_id,
+                                            &observation.route_kind,
+                                            &observation.route,
+                                        );
+                                    }
+                                }
                                 *close_reason_ping_task.lock().await =
                                     format!("upstream: ping_{}", reason);
                                 cancel_ping.cancel();
