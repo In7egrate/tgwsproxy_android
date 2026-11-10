@@ -175,14 +175,14 @@ class ProxyService : Service() {
                 }
             } else {
                 val err = json.optString("error").ifEmpty { state }
-                val safeError = err.replace('\\r', ' ').replace('\\n', ' ').take(120)
+                val safeError = err.replace('\r', ' ').replace('\n', ' ').take(120)
                 DiagnosticStore.record(this, "service_start_failed state=${state.take(80)} error=$safeError")
                 Log.e(TAG, "Прокси не запустился: $err")
                 releaseWakeLock()
                 ui.post { updateNotification(err) }
             }
         } catch (t: Throwable) {
-            val safeError = (t.message ?: "").replace('\\r', ' ').replace('\\n', ' ').take(120)
+            val safeError = (t.message ?: "").replace('\r', ' ').replace('\n', ' ').take(120)
             DiagnosticStore.record(this, "service_start_exception type=${t.javaClass.simpleName} message=$safeError")
             Log.e(TAG, "Ошибка запуска прокси", t)
             isRunning = false
