@@ -1965,43 +1965,93 @@ where
             .cf_worker
             .get(dc, fallback_dst.clone(), worker_domains.clone())
             .await;
+        let mut worker_observation: Option<RouteObservation> = None;
         let worker_ws = if let Some((ws, worker_domain)) = pooled {
-            linfo!(
-                "[{}] DC{}{} -> CF worker pool hit via {} for {}",
-                label, dc, m_tag, worker_domain, fallback_dst
-            );
-            Some(ws)
+            let attempt_kind = crate::balancer::BALANCER
+                .write()
+                .begin_attempt(dc, "cf_worker", &worker_domain);
+            if let Some(attempt_kind) = attempt_kind {
+                worker_observation = Some(RouteObservation {
+                    dc_id: dc,
+                    route_kind: "cf_worker".to_string(),
+                    route: worker_domain.clone(),
+                    attempt_kind,
+                    connected_at: Instant::now(),
+                });
+                linfo!(
+                    "[{}] DC{}{} -> CF worker pool hit via {} for {}",
+                    label, dc, m_tag, worker_domain, fallback_dst
+                );
+                Some(ws)
+            } else {
+                ws.close().await;
+                record_diagnostic("route_circuit_skip kind=cf_worker pool=1");
+                None
+            }
         } else {
             let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
             let query = format!("dst={}&dc={}", fallback_dst, dc);
             let path = format!("/apiws?{}", query);
             let mut found = None;
             for worker_domain in pools.cf_worker.available_domains(dc, worker_domains.clone()).await {
+                let attempt_kind = match crate::balancer::BALANCER
+                    .write()
+                    .begin_attempt(dc, "cf_worker", &worker_domain)
+                {
+                    Some(kind) => kind,
+                    None => continue,
+                };
+                let _dial_permit = match try_direct_ws_dial_slot() {
+                    Some(permit) => permit,
+                    None => {
+                        crate::balancer::BALANCER.write().cancel_attempt(
+                            dc, "cf_worker", &worker_domain, attempt_kind
+                        );
+                        record_diagnostic("direct_ws_dial_budget_saturated kind=cf_worker");
+                        continue;
+                    }
+                };
                 linfo!(
                     "[{}] DC{}{} -> trying CF worker {} for {}",
                     label, dc, m_tag, worker_domain, fallback_dst
                 );
                 let route_started = Instant::now();
-                let attempt = ws_connect_full_opts(
-                    &worker_domain,
-                    &worker_domain,
-                    &path,
-                    10.0,
-                    None,
-                    Some(secure),
-                )
-                .await;
-                if attempt.is_ok() {
-                    crate::balancer::BALANCER.write().record_success(
-                        dc, "cf_worker", &worker_domain, route_started.elapsed()
-                    );
-                } else {
-                    crate::balancer::BALANCER.write().record_failure(
-                        dc, "cf_worker", &worker_domain
-                    );
+                let attempt = tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        crate::balancer::BALANCER.write().cancel_attempt(
+                            dc, "cf_worker", &worker_domain, attempt_kind
+                        );
+                        return false;
+                    }
+                    result = ws_connect_full_opts(
+                        &worker_domain,
+                        &worker_domain,
+                        &path,
+                        10.0,
+                        None,
+                        Some(secure),
+                    ) => result,
+                };
+                match &attempt {
+                    Ok(_) => crate::balancer::BALANCER.write().record_connect_success(
+                        dc, "cf_worker", &worker_domain, route_started.elapsed(), attempt_kind
+                    ),
+                    Err(WsError::Canceled) => crate::balancer::BALANCER.write().cancel_attempt(
+                        dc, "cf_worker", &worker_domain, attempt_kind
+                    ),
+                    Err(_) => crate::balancer::BALANCER.write().record_attempt_failure(
+                        dc, "cf_worker", &worker_domain, attempt_kind
+                    ),
                 }
                 match attempt {
                     Ok(ws) => {
+                        worker_observation = Some(RouteObservation {
+                            dc_id: dc,
+                            route_kind: "cf_worker".to_string(),
+                            route: worker_domain.clone(),
+                            attempt_kind,
+                            connected_at: route_started,
+                        });
                         found = Some(ws);
                         break;
                     }
@@ -2026,19 +2076,23 @@ where
                     label,
                     dc,
                     is_media,
-                    None, // оригинал: splitter=None для worker
+                    None,
                     clt_dec.clone_state(),
                     clt_enc.clone_state(),
                     tg_enc.clone_state(),
                     tg_dec.clone_state(),
                     cancel_token,
-                    None,
+                    worker_observation,
                 )
                 .await;
                 return true;
             }
+            if let Some(observation) = worker_observation.take() {
+                crate::balancer::BALANCER.write().record_early_failure(
+                    observation.dc_id, &observation.route_kind, &observation.route
+                );
+            }
             ws.close().await;
-            // send failed — падаем сквозь к CF/TCP на тех же halves.
         }
     }
 
