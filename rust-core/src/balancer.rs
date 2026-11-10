@@ -511,47 +511,7 @@ impl Balancer {
         ranked.into_iter().map(|(_, _, route)| route).collect()
     }
 
-    /// Diagnostic snapshot intentionally exposes a stable route hash rather
-    /// than custom Worker/CF hostnames supplied by the user.
-    pub fn metrics_snapshot(&self) -> Vec<serde_json::Value> {
-        let mut rows: Vec<serde_json::Value> = self
-            .route_metrics
-            .iter()
-            .map(|((dc, kind, route), metric)| {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                route.hash(&mut hasher);
-                let route_id = format!("{:016x}", hasher.finish());
-                let cooldown_remaining_ms = metric
-                    .cooldown_until
-                    .filter(|until| *until > Instant::now())
-                    .map(|until| until.saturating_duration_since(Instant::now()).as_millis() as u64)
-                    .unwrap_or(0);
-                serde_json::json!({
-                    "dc": dc,
-                    "kind": kind,
-                    "route_id": route_id,
-                    "samples": metric.samples,
-                    "latency_ewma_ms": metric.latency_ewma_ms.round() as u64,
-                    "success_rate_permille": (metric.success_ewma * 1000.0).round() as u16,
-                    "cooldown_remaining_ms": cooldown_remaining_ms,
-                })
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            let a_key = (
-                a["dc"].as_i64().unwrap_or_default(),
-                a["kind"].as_str().unwrap_or_default().to_string(),
-                a["route_id"].as_str().unwrap_or_default().to_string(),
-            );
-            let b_key = (
-                b["dc"].as_i64().unwrap_or_default(),
-                b["kind"].as_str().unwrap_or_default().to_string(),
-                b["route_id"].as_str().unwrap_or_default().to_string(),
-            );
-            a_key.cmp(&b_key)
-        });
-        rows
-    }
+
 }
 
 #[cfg(test)]
@@ -568,6 +528,30 @@ mod adaptive_route_tests {
         ];
         let ranked = balancer.rank_candidates(2, "telegram_ws", &candidates);
         assert_eq!(ranked[0], "kws2.web.telegram.org");
+    }
+
+    #[test]
+    fn handshake_only_measurements_do_not_beat_unmeasured_routes() {
+        let mut balancer = Balancer::new();
+        let attempt = balancer
+            .begin_attempt(2, "telegram_ws", "kws2.web.telegram.org")
+            .unwrap();
+        balancer.record_connect_success(
+            2,
+            "telegram_ws",
+            "kws2.web.telegram.org",
+            Duration::from_millis(40),
+            attempt,
+        );
+        let candidates = vec![
+            "kws2.web.telegram.org".to_string(),
+            "kws2-1.web.telegram.org".to_string(),
+        ];
+        let ranked = balancer.rank_candidates(2, "telegram_ws", &candidates);
+        assert_eq!(ranked[0], "kws2-1.web.telegram.org");
+        let snapshot = serde_json::to_string(&balancer.metrics_snapshot()).unwrap();
+        assert!(snapshot.contains("connect_only"));
+        assert!(snapshot.contains("\\"first_byte_samples\\":0"));
     }
 
     #[test]
