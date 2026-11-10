@@ -1742,6 +1742,14 @@ async fn try_cfproxy_base_domain(
         Some(p) => p,
         None => return (None, String::new()),
     };
+    let _route_permits = match acquire_route_connect_slot(dc, "cf_proxy", &base_domain).await {
+        Some(permits) => permits,
+        None => return (None, String::new()),
+    };
+    if !crate::balancer::BALANCER.write().allow_attempt(dc, "cf_proxy", &base_domain) {
+        record_diagnostic(&format!("route_circuit_skip kind=cf_proxy dc={}", dc));
+        return (None, String::new());
+    }
 
     let domain = format!("kws{}.{}", dc, base_domain);
     ldebug!(" CF try {}", domain);
@@ -1756,6 +1764,11 @@ async fn try_cfproxy_base_domain(
             WsError::Other(_) => "other",
         };
         record_diagnostic(&format!("cf_connect_fail dc={} reason={}", dc, reason));
+        if matches!(e, WsError::Canceled) {
+            crate::balancer::BALANCER.write().release_attempt(dc, "cf_proxy", &base_domain);
+        } else {
+            crate::balancer::BALANCER.write().record_failure(dc, "cf_proxy", &base_domain);
+        }
         // Cooldown ставим ТОЛЬКО при HTTP 429, иначе любой reset/timeout
         // выжигал бы домены и плодил лавину cooldown.
         if is_http_status_error(&e, 429) {
@@ -1830,17 +1843,7 @@ async fn cfproxy_acquire_ws(
                 _ = cancel.cancelled() => None,
                 result = async {
                     let _permit = sem.acquire_owned().await.ok()?;
-                    let started = Instant::now();
                     let (candidate, domain) = try_cfproxy_base_domain(dc, &base_domain, &path).await;
-                    if candidate.is_some() {
-                        crate::balancer::BALANCER.write().record_success(
-                            dc, "cf_proxy", &domain, started.elapsed()
-                        );
-                    } else {
-                        crate::balancer::BALANCER.write().record_failure(
-                            dc, "cf_proxy", &base_domain
-                        );
-                    }
                     candidate.map(|socket| (socket, domain))
                 } => result,
             }
