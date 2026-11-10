@@ -2099,7 +2099,7 @@ where
     // Шаг 2: cf-ws (без halves).
     if use_cf {
         record_diagnostic(&format!("route_attempt kind=cf_proxy dc={} media={}", dc, is_media as u8));
-        if let Some((ws, _chosen_domain)) =
+        if let Some((ws, _chosen_domain, observation)) =
             cfproxy_acquire_ws(dc, is_media, ws_path, &cancel_token).await
         {
             STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
@@ -2119,11 +2119,14 @@ where
                     tg_enc.clone_state(),
                     tg_dec.clone_state(),
                     cancel_token,
-                    None,
+                    Some(observation),
                 )
                 .await;
                 return true;
             }
+            crate::balancer::BALANCER.write().record_early_failure(
+                observation.dc_id, &observation.route_kind, &observation.route
+            );
             ws.close().await;
             // CF умер сразу после хендшейка — пробуем TCP на том же conn.
         }
