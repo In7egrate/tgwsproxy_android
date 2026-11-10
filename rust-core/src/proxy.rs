@@ -2429,6 +2429,7 @@ async fn serve_core<R, W>(
         .rank_candidates(dc, "telegram_ws", &direct_candidates);
     // pooled_ws уже может держать WS из cooldown-ветки.
     let mut ws_opt = pooled_ws;
+    let mut route_observation: Option<RouteObservation> = None;
     let mut ws_failed_redirect = false;
     let mut ws_timed_out = false;
     let mut all_ws_attempts_timed_out = true;
@@ -2448,17 +2449,51 @@ async fn serve_core<R, W>(
         for domain in &domains {
             let url = format!("wss://{}{} via {}", domain, ws_path, target);
             linfo!("[{}] DC{}{} -> {}", label, dc, m_tag, url);
+            let attempt_kind = match crate::balancer::BALANCER
+                .write()
+                .begin_attempt(dc, "telegram_ws", domain)
+            {
+                Some(kind) => kind,
+                None => {
+                    record_diagnostic(&format!(
+                        "route_circuit_skip dc={} kind=telegram_ws",
+                        dc
+                    ));
+                    continue;
+                }
+            };
+            let _dial_permit = match try_direct_ws_dial_slot() {
+                Some(permit) => permit,
+                None => {
+                    crate::balancer::BALANCER.write().cancel_attempt(
+                        dc, "telegram_ws", domain, attempt_kind
+                    );
+                    record_diagnostic("direct_ws_dial_budget_saturated");
+                    continue;
+                }
+            };
             let route_started = Instant::now();
             let attempt = ws_connect_full_opts(&target, domain, ws_path, ws_timeout, None, None).await;
-            if attempt.is_ok() {
-                crate::balancer::BALANCER.write().record_success(
-                    dc, "telegram_ws", domain, route_started.elapsed()
-                );
-            } else {
-                crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", domain);
+            match &attempt {
+                Ok(_) => crate::balancer::BALANCER.write().record_connect_success(
+                    dc, "telegram_ws", domain, route_started.elapsed(), attempt_kind
+                ),
+                Err(WsError::Canceled) => crate::balancer::BALANCER.write().cancel_attempt(
+                    dc, "telegram_ws", domain, attempt_kind
+                ),
+                Err(_) => crate::balancer::BALANCER.write().record_attempt_failure(
+                    dc, "telegram_ws", domain, attempt_kind
+                ),
             }
             match attempt {
                 Ok(ws) => {
+                    route_observation = Some(RouteObservation {
+                        dc_id: dc,
+                        route_kind: "telegram_ws".to_string(),
+                        route: domain.clone(),
+                        attempt_kind,
+                        connected_at: route_started,
+                    });
                     record_diagnostic(&format!("ws_direct_connect_ok dc={} media={}", dc, is_media as u8));
                     all_redirects = false;
                     ws_opt = Some(ws);
@@ -2594,12 +2629,17 @@ async fn serve_core<R, W>(
     } else {
         lwarn!(" direct relayInit write fail DC{}{}: closed", dc, m_tag);
         ws.close().await;
+        if let Some(observation) = route_observation.take() {
+            crate::balancer::BALANCER.write().record_early_failure(
+                observation.dc_id, &observation.route_kind, &observation.route
+            );
+        }
 
         DC_FAIL_UNTIL.write().insert(dc_key, now + DC_FAIL_COOLDOWN);
 
         lwarn!(" direct retry fresh ws DC{}{}", dc, m_tag);
-        let (retry_ws, retry_failed_redirect, retry_all_redirects) =
-            connect_direct_ws(dc, &target, &domains, ws_timeout, ws_path).await;
+        let (retry_ws, retry_failed_redirect, retry_all_redirects, retry_observation) =
+            connect_direct_ws(dc, &target, &domains, ws_timeout, ws_path, &cancel_token).await;
         match retry_ws {
             None => {
                 if retry_failed_redirect && retry_all_redirects {
@@ -2628,7 +2668,13 @@ async fn serve_core<R, W>(
                 return;
             }
             Some(rws) => {
+                route_observation = retry_observation;
                 if rws.send(&relay_init).await.is_err() {
+                    if let Some(observation) = route_observation.take() {
+                        crate::balancer::BALANCER.write().record_early_failure(
+                            observation.dc_id, &observation.route_kind, &observation.route
+                        );
+                    }
                     lwarn!(" direct relayInit write fail DC{}{}: closed", dc, m_tag);
                     rws.close().await;
                     lwarn!(" direct fallback DC{}{}", dc, m_tag);
@@ -2673,7 +2719,7 @@ async fn serve_core<R, W>(
         tg_encryptor,
         tg_decryptor,
         cancel_token,
-        None,
+        route_observation,
     )
     .await;
 }
