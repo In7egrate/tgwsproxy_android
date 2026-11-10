@@ -1993,13 +1993,17 @@ async fn cfproxy_acquire_ws(
     // already completed successfully at the same time as the winner.
     attempts.abort_all();
     while let Some(result) = attempts.join_next().await {
-        if let Ok(Some((extra, _, _))) = result {
+        if let Ok(Some((extra, extra_domain, _))) = result {
             extra.close().await;
+            crate::balancer::BALANCER.write().release_validation(dc, "cf_proxy", &extra_domain);
         }
     }
-    if canceled {
+    if canceled || cancel_token.is_cancelled() {
         if let Some(socket) = ws.take() {
             socket.close().await;
+            if !chosen_domain.is_empty() {
+                crate::balancer::BALANCER.write().release_validation(dc, "cf_proxy", &chosen_domain);
+            }
         }
         return None;
     }
