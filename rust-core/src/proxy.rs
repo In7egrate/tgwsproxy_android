@@ -1361,7 +1361,10 @@ pub async fn bridge_ws<R, W>(
                 Err(error) => {
                     let reason = match error {
                         WsError::Timeout => "upstream: read_timeout",
-                        WsError::Canceled => "upstream: canceled",
+                        // Cancellation is normally caused by the opposite
+                        // relay direction (for example a clean client EOF).
+                        // Do not misclassify it as a failed upstream route.
+                        WsError::Canceled => "",
                         WsError::Handshake(_) => "upstream: handshake_error",
                         WsError::Other(ref text) if text.starts_with("ws_close_frame:") => {
                             if text == "ws_close_frame:normal" {
@@ -1382,7 +1385,9 @@ pub async fn bridge_ws<R, W>(
                         },
                         WsError::Other(_) => "upstream: protocol_error",
                     };
-                    *close_reason_down_c.lock().await = reason.to_string();
+                    if !reason.is_empty() {
+                        *close_reason_down_c.lock().await = reason.to_string();
+                    }
                     break;
                 }
             };
