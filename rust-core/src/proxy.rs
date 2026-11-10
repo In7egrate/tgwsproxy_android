@@ -2035,14 +2035,13 @@ async fn try_cfproxy_base_domain(
             None => return (None, String::new(), None),
         },
     };
-    let route_generation = crate::balancer::BALANCER.read().generation();
-    let attempt_kind = match crate::balancer::BALANCER
+    let (attempt_kind, route_generation) = match crate::balancer::BALANCER
         .write()
-        .begin_attempt(dc, "cf_proxy", &base_domain)
+        .begin_attempt_with_generation(dc, "cf_proxy", &base_domain)
     {
-        Some(kind) => {
+        Some((kind, generation)) => {
             STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
-            kind
+            (kind, generation)
         }
         None => {
             STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
@@ -2056,8 +2055,8 @@ async fn try_cfproxy_base_domain(
     let started = Instant::now();
     let result = tokio::select! {
         _ = cancel_token.cancelled() => {
-            crate::balancer::BALANCER.write().cancel_attempt(
-                dc, "cf_proxy", &base_domain, attempt_kind
+            crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                route_generation, dc, "cf_proxy", &base_domain, attempt_kind
             );
             return (None, String::new(), None);
         }
@@ -2076,12 +2075,12 @@ async fn try_cfproxy_base_domain(
     }
     if let Some(e) = err {
         if matches!(e, WsError::Canceled) {
-            crate::balancer::BALANCER.write().cancel_attempt(
-                dc, "cf_proxy", &base_domain, attempt_kind
+            crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                route_generation, dc, "cf_proxy", &base_domain, attempt_kind
             );
         } else {
-            crate::balancer::BALANCER.write().record_attempt_failure(
-                dc, "cf_proxy", &base_domain, attempt_kind
+            crate::balancer::BALANCER.write().record_attempt_failure_for_generation(
+                route_generation, dc, "cf_proxy", &base_domain, attempt_kind
             );
         }
         let reason = match &e {
@@ -2107,14 +2106,14 @@ async fn try_cfproxy_base_domain(
     }
 
     let Some(ws) = ws else {
-        crate::balancer::BALANCER.write().record_attempt_failure(
-            dc, "cf_proxy", &base_domain, attempt_kind
+        crate::balancer::BALANCER.write().record_attempt_failure_for_generation(
+            route_generation, dc, "cf_proxy", &base_domain, attempt_kind
         );
         record_diagnostic(&format!("cf_connect_fail dc={} reason=no_socket", dc));
         return (None, String::new(), None);
     };
-    crate::balancer::BALANCER.write().record_connect_success(
-        dc, "cf_proxy", &base_domain, started.elapsed(), attempt_kind
+    crate::balancer::BALANCER.write().record_connect_success_for_generation(
+        route_generation, dc, "cf_proxy", &base_domain, started.elapsed(), attempt_kind
     );
     clear_cfproxy_429_cooldown(&base_domain);
     record_diagnostic(&format!("cf_connect_ok dc={} connect_ms={}", dc, started.elapsed().as_millis()));
