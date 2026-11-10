@@ -1383,14 +1383,13 @@ pub async fn bridge_ws<R, W>(
                         match ws_ping.send_ping().await {
                             Ok(rtt) => {
                                 if let Some(observation) = route_for_ping.as_ref() {
-                                    if crate::balancer::BALANCER.read().generation() == observation.generation {
-                                        crate::balancer::BALANCER.write().record_ping_success(
-                                            observation.dc_id,
-                                            &observation.route_kind,
-                                            &observation.route,
-                                            rtt,
-                                        );
-                                    }
+                                    crate::balancer::BALANCER.write().record_ping_success_for_generation(
+                                        observation.generation,
+                                        observation.dc_id,
+                                        &observation.route_kind,
+                                        &observation.route,
+                                        rtt,
+                                    );
                                 }
                                 record_diagnostic(&format!(
                                     "ws_ping_ok session={} rtt_ms={}", session_id, rtt.as_millis()
@@ -1411,13 +1410,12 @@ pub async fn bridge_ws<R, W>(
                                 if !matches!(&error, WsError::Canceled) {
                                     if let Some(observation) = route_for_ping.as_ref() {
                                         STATS.route_early_failures.fetch_add(1, Ordering::Relaxed);
-                                        if crate::balancer::BALANCER.read().generation() == observation.generation {
-                                            crate::balancer::BALANCER.write().record_ping_failure(
-                                                observation.dc_id,
-                                                &observation.route_kind,
-                                                &observation.route,
-                                            );
-                                        }
+                                        crate::balancer::BALANCER.write().record_ping_failure_for_generation(
+                                            observation.generation,
+                                            observation.dc_id,
+                                            &observation.route_kind,
+                                            &observation.route,
+                                        );
                                     }
                                 }
                                 *close_reason_ping_task.lock().await =
@@ -1611,15 +1609,12 @@ pub async fn bridge_ws<R, W>(
                         observation.route_kind.clone(),
                         observation.route.clone(),
                         observation.attempt_kind,
+                        observation.generation,
                     ));
-                    if let Some((dc_id, route_kind, route, attempt_kind)) = probe {
-                        if crate::balancer::BALANCER.read().generation()
-                            == route_observation_down.lock().await.as_ref().map(|o| o.generation).unwrap_or(u64::MAX)
-                        {
-                            crate::balancer::BALANCER.write().release_probe(
-                                dc_id, &route_kind, &route, attempt_kind
-                            );
-                        }
+                    if let Some((dc_id, route_kind, route, attempt_kind, generation)) = probe {
+                        crate::balancer::BALANCER.write().release_probe_for_generation(
+                            generation, dc_id, &route_kind, &route, attempt_kind
+                        );
                         record_diagnostic(&format!(
                             "route_probe_neutral dc={} kind={} reason=no_client_request",
                             dc_id, route_kind
@@ -1673,14 +1668,13 @@ pub async fn bridge_ws<R, W>(
                     };
                     let elapsed = request_elapsed
                         .unwrap_or_else(|| observation.connected_at.elapsed());
-                    if crate::balancer::BALANCER.read().generation() == observation.generation {
-                        crate::balancer::BALANCER.write().record_first_byte_success(
-                            observation.dc_id,
-                            &observation.route_kind,
-                            &observation.route,
-                            elapsed,
-                        );
-                    } else {
+                    if !crate::balancer::BALANCER.write().record_first_byte_success_for_generation(
+                        observation.generation,
+                        observation.dc_id,
+                        &observation.route_kind,
+                        &observation.route,
+                        elapsed,
+                    ) {
                         record_diagnostic("route_first_byte_ignored reason=network_generation_changed");
                     }
                     STATS.first_byte_latency_ms.store(
@@ -1745,24 +1739,24 @@ pub async fn bridge_ws<R, W>(
         let upstream_failed = close_reason.starts_with("upstream:")
             && close_reason != "upstream: canceled";
         let send_failed = close_reason.contains("send_failed");
-        if crate::balancer::BALANCER.read().generation() != observation.generation {
-            record_diagnostic(&format!(
-                "route_probe_neutral dc={} kind={} reason=network_generation_changed",
-                observation.dc_id, observation.route_kind
-            ));
-        } else if (request_was_sent && upstream_failed) || send_failed {
+        if (request_was_sent && upstream_failed) || send_failed {
             STATS.route_early_failures.fetch_add(1, Ordering::Relaxed);
-            crate::balancer::BALANCER.write().record_early_failure(
+            let recorded = crate::balancer::BALANCER.write().record_early_failure_for_generation(
+                observation.generation,
                 observation.dc_id,
                 &observation.route_kind,
                 &observation.route,
             );
             record_diagnostic(&format!(
-                "route_probe_failed dc={} kind={} reason=early_close",
-                observation.dc_id, observation.route_kind
+                "route_probe_{} dc={} kind={} reason={}",
+                if recorded { "failed" } else { "neutral" },
+                observation.dc_id,
+                observation.route_kind,
+                if recorded { "early_close" } else { "network_generation_changed" }
             ));
         } else {
-            crate::balancer::BALANCER.write().release_probe(
+            crate::balancer::BALANCER.write().release_probe_for_generation(
+                observation.generation,
                 observation.dc_id,
                 &observation.route_kind,
                 &observation.route,
