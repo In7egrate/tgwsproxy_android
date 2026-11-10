@@ -1548,6 +1548,7 @@ pub async fn bridge_tcp<CR, CW>(
     clt_enc: TrackedStream,
     tg_enc: TrackedStream,
     tg_dec: TrackedStream,
+    route_observation: Option<RouteObservation>,
     cancel_token: CancellationToken,
 ) where
     CR: AsyncReadExt + Unpin + Send + 'static,
@@ -1597,6 +1598,9 @@ pub async fn bridge_tcp<CR, CW>(
     let cancel_token_down = cancel_token.clone();
     let tg_dec_down = tg_dec.clone();
     let clt_enc_down = clt_enc.clone();
+    let first_byte_recorded = Arc::new(AtomicBool::new(false));
+    let first_byte_recorded_down = first_byte_recorded.clone();
+    let route_observation_down = route_observation.clone();
     let down = async move {
         let mut buf = vec![0u8; 131072];
         loop {
@@ -1609,6 +1613,27 @@ pub async fn bridge_tcp<CR, CW>(
                     _ => break,
                 },
             };
+            if n > 0 {
+                if let Some(observation) = route_observation_down.as_ref() {
+                    if !first_byte_recorded_down.swap(true, Ordering::AcqRel) {
+                        let elapsed = observation.started.elapsed();
+                        let elapsed_ms = elapsed.as_millis().min(i64::MAX as u128) as i64;
+                        STATS.first_byte_last_ms.store(elapsed_ms, Ordering::Relaxed);
+                        STATS.first_byte_total_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
+                        STATS.first_byte_count.fetch_add(1, Ordering::Relaxed);
+                        crate::balancer::BALANCER.write().record_success(
+                            observation.dc,
+                            observation.kind,
+                            &observation.route,
+                            elapsed,
+                        );
+                        record_diagnostic(&format!(
+                            "route_first_byte kind={} dc={} elapsed_ms={}",
+                            observation.kind, observation.dc, elapsed_ms
+                        ));
+                    }
+                }
+            }
             let chunk = &mut buf[..n];
             STATS.bytes_down.fetch_add(n as i64, Ordering::Relaxed);
             tg_dec_down.lock().await.xor(chunk);
@@ -1643,6 +1668,7 @@ pub async fn bridge_tcp_stream(
         clt_enc,
         tg_enc,
         tg_dec,
+        None,
         cancel_token,
     )
     .await;
@@ -1671,33 +1697,45 @@ where
         Ok(ip) => SocketAddr::new(ip, port).to_string(),
         Err(_) => format!("{}:{}", dst, port),
     };
+    let _route_permits = match acquire_route_connect_slot(dc, "tcp_fallback", &addr).await {
+        Some(permits) => permits,
+        None => return false,
+    };
+    if !crate::balancer::BALANCER.write().allow_attempt(dc, "tcp_fallback", &addr) {
+        record_diagnostic(&format!("route_circuit_skip kind=tcp_fallback dc={}", dc));
+        return false;
+    }
     let tcp_started = Instant::now();
-    let mut remote =
-        match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await {
-            Ok(Ok(r)) => {
-                crate::balancer::BALANCER.write().record_success(
-                    dc, "tcp_fallback", &addr, tcp_started.elapsed()
-                );
-                record_diagnostic(&format!("tcp_fallback_connect_ok duration_ms={}", tcp_started.elapsed().as_millis()));
-                r
-            }
-            Ok(Err(e)) => {
-                crate::balancer::BALANCER.write().record_failure(dc, "tcp_fallback", &addr);
-                record_diagnostic(&format!("tcp_fallback_connect_fail reason={:?}", e.kind()));
-                lwarn!("[{}] TCP fallback to {}:{} failed: {}", label, dst, port, e);
-                return false;
-            }
-            Err(_) => {
-                crate::balancer::BALANCER.write().record_failure(dc, "tcp_fallback", &addr);
-                record_diagnostic("tcp_fallback_connect_fail reason=timeout");
-                lwarn!("[{}] TCP fallback to {}:{} failed: timeout", label, dst, port);
-                return false;
-            }
-        };
+    let connect_result = tokio::select! {
+        _ = cancel_token.cancelled() => {
+            crate::balancer::BALANCER.write().release_attempt(dc, "tcp_fallback", &addr);
+            return false;
+        }
+        result = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr)) => result,
+    };
+    let mut remote = match connect_result {
+        Ok(Ok(remote)) => {
+            record_diagnostic(&format!("tcp_fallback_connect_ok duration_ms={}", tcp_started.elapsed().as_millis()));
+            remote
+        }
+        Ok(Err(error)) => {
+            crate::balancer::BALANCER.write().record_failure(dc, "tcp_fallback", &addr);
+            record_diagnostic(&format!("tcp_fallback_connect_fail reason={:?}", error.kind()));
+            lwarn!("[{}] TCP fallback to {}:{} failed: {}", label, dst, port, error);
+            return false;
+        }
+        Err(_) => {
+            crate::balancer::BALANCER.write().record_failure(dc, "tcp_fallback", &addr);
+            record_diagnostic("tcp_fallback_connect_fail reason=timeout");
+            lwarn!("[{}] TCP fallback to {}:{} failed: timeout", label, dst, port);
+            return false;
+        }
+    };
     let _ = remote.set_nodelay(true);
 
     STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
     if remote.write_all(init).await.is_err() {
+        crate::balancer::BALANCER.write().record_failure(dc, "tcp_fallback", &addr);
         record_diagnostic("tcp_fallback_init_write_fail");
         return false;
     }
@@ -1710,6 +1748,12 @@ where
         clt_enc,
         tg_enc,
         tg_dec,
+        Some(RouteObservation {
+            dc,
+            kind: "tcp_fallback",
+            route: addr,
+            started: tcp_started,
+        }),
         cancel_token,
     )
     .await;
