@@ -851,6 +851,7 @@ pub struct CfWorkerEntry {
     pub created: f64,
     pub worker_domain: String,
     pub generation: u64,
+    pub route_generation: u64,
     _budget_permit: OwnedSemaphorePermit,
 }
 
@@ -882,7 +883,7 @@ impl CfWorkerPool {
         dc: i32,
         fallback_dst: String,
         worker_domains: Vec<String>,
-    ) -> Option<(RawWebSocket, String)> {
+    ) -> Option<(RawWebSocket, String, u64)> {
         let generation = self.generation.load(Ordering::Acquire);
         let now = now_monotonic();
         let (entry, stale_sockets) = {
@@ -916,9 +917,9 @@ impl CfWorkerPool {
                     e.worker_domain,
                     now - e.created
                 );
-                let CfWorkerEntry { ws, worker_domain, _budget_permit, .. } = e;
+                let CfWorkerEntry { ws, worker_domain, route_generation, _budget_permit, .. } = e;
                 drop(_budget_permit);
-                Some((ws, worker_domain))
+                Some((ws, worker_domain, route_generation))
             }
             None => {
                 STATS.cf_pool_misses.fetch_add(1, Ordering::Relaxed);
@@ -928,7 +929,7 @@ impl CfWorkerPool {
         };
 
         if self.generation.load(Ordering::Acquire) != generation {
-            if let Some((socket, _)) = result.take() {
+            if let Some((socket, _, _)) = result.take() {
                 socket.close().await;
             }
             return None;
@@ -1003,12 +1004,12 @@ impl CfWorkerPool {
                         worker_domains, fallback_dst, dc, generation, cancel.clone()
                     )
                     .await
-                    .map(|(ws, domain)| (ws, domain, permit))
+                    .map(|(ws, domain, route_generation)| (ws, domain, route_generation, permit))
                 } else {
                     None
                 };
 
-                if let Some((ws, domain, budget_permit)) = connected {
+                if let Some((ws, domain, route_generation, budget_permit)) = connected {
                     let mut map = pool.idle.lock().await;
                     if pool.generation.load(Ordering::Acquire) == generation {
                         let bucket = map.entry(dc).or_insert_with(VecDeque::new);
@@ -1018,6 +1019,7 @@ impl CfWorkerPool {
                                 created: now_monotonic(),
                                 worker_domain: domain,
                                 generation,
+                                route_generation,
                                 _budget_permit: budget_permit,
                             });
                             record_diagnostic(&format!("cf_pool_refill_ok dc={}", dc));
@@ -1056,7 +1058,7 @@ impl CfWorkerPool {
         dc: i32,
         generation: u64,
         cancel: CancellationToken,
-    ) -> Option<(RawWebSocket, String)> {
+    ) -> Option<(RawWebSocket, String, u64)> {
         let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
         let query = format!("dst={}&dc={}", fallback_dst, dc);
         let path = format!("/apiws?{}", query);
@@ -1125,7 +1127,7 @@ impl CfWorkerPool {
                     crate::balancer::BALANCER.write().record_connect_success(
                         dc, "cf_worker", &worker_domain, started.elapsed(), attempt_kind
                     );
-                    return Some((ws, worker_domain));
+                    return Some((ws, worker_domain, route_generation));
                 }
                 Err(WsError::Canceled) => {
                     crate::balancer::BALANCER.write().cancel_attempt(
