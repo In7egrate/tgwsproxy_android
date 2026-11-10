@@ -854,6 +854,34 @@ mod adaptive_route_tests {
     }
 
     #[test]
+    fn stale_session_observations_do_not_repopulate_reset_metrics() {
+        let mut balancer = Balancer::new();
+        let old_generation = balancer.generation();
+        balancer.reset_route_metrics();
+        assert!(!balancer.record_first_byte_success_for_generation(
+            old_generation,
+            2,
+            "telegram_ws",
+            "kws2.web.telegram.org",
+            Duration::from_millis(50),
+        ));
+        assert!(!balancer.record_ping_success_for_generation(
+            old_generation,
+            2,
+            "telegram_ws",
+            "kws2.web.telegram.org",
+            Duration::from_millis(40),
+        ));
+        assert!(!balancer.record_early_failure_for_generation(
+            old_generation,
+            2,
+            "telegram_ws",
+            "kws2.web.telegram.org",
+        ));
+        assert!(balancer.route_metrics.is_empty());
+    }
+
+    #[test]
     fn reset_invalidates_old_attempt_completion_without_decrementing_new_dial() {
         let mut balancer = Balancer::new();
         let (old_attempt, old_generation) = balancer
