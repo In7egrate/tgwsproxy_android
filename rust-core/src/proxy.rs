@@ -481,20 +481,17 @@ impl WsPool {
             if self.generation.load(Ordering::Acquire) != generation {
                 return None;
             }
-            let route_generation = crate::balancer::BALANCER.read().generation();
-            let attempt_kind = match crate::balancer::BALANCER
+            let (attempt_kind, route_generation) = match crate::balancer::BALANCER
                 .write()
-                .begin_attempt(dc, "telegram_ws", &domain)
+                .begin_attempt_with_generation(dc, "telegram_ws", &domain)
             {
-                Some(RouteAttemptKind::Closed) => {
+                Some((RouteAttemptKind::Closed, generation)) => {
                     STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
-                    RouteAttemptKind::Closed
+                    (RouteAttemptKind::Closed, generation)
                 }
-                Some(RouteAttemptKind::HalfOpen) => {
-                    // A prewarmed idle socket cannot prove application health.
-                    // Leave recovery probes to a real client session.
-                    crate::balancer::BALANCER.write().cancel_attempt(
-                        dc, "telegram_ws", &domain, RouteAttemptKind::HalfOpen
+                Some((RouteAttemptKind::HalfOpen, generation)) => {
+                    crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                        generation, dc, "telegram_ws", &domain, RouteAttemptKind::HalfOpen
                     );
                     continue;
                 }
@@ -506,8 +503,8 @@ impl WsPool {
             let _dial_permit = match try_direct_ws_dial_slot() {
                 Some(permit) => permit,
                 None => {
-                    crate::balancer::BALANCER.write().cancel_attempt(
-                        dc, "telegram_ws", &domain, attempt_kind
+                    crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                        route_generation, dc, "telegram_ws", &domain, attempt_kind
                     );
                     record_diagnostic("direct_ws_dial_budget_saturated pool=1");
                     continue;
@@ -516,8 +513,8 @@ impl WsPool {
             let started = Instant::now();
             let attempt = tokio::select! {
                 _ = cancel.cancelled() => {
-                    crate::balancer::BALANCER.write().cancel_attempt(
-                        dc, "telegram_ws", &domain, attempt_kind
+                    crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                        route_generation, dc, "telegram_ws", &domain, attempt_kind
                     );
                     return None;
                 }
@@ -559,14 +556,14 @@ impl WsPool {
                         ws.close().await;
                         return None;
                     }
-                    crate::balancer::BALANCER.write().record_connect_success(
-                        dc, "telegram_ws", &domain, started.elapsed(), attempt_kind
+                    crate::balancer::BALANCER.write().record_connect_success_for_generation(
+                        route_generation, dc, "telegram_ws", &domain, started.elapsed(), attempt_kind
                     );
                     return Some((ws, domain, route_generation));
                 }
                 Err(WsError::Canceled) => {
-                    crate::balancer::BALANCER.write().cancel_attempt(
-                        dc, "telegram_ws", &domain, attempt_kind
+                    crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                        route_generation, dc, "telegram_ws", &domain, attempt_kind
                     );
                     return None;
                 }
@@ -579,8 +576,8 @@ impl WsPool {
                         );
                         return None;
                     }
-                    crate::balancer::BALANCER.write().record_attempt_failure(
-                        dc, "telegram_ws", &domain, attempt_kind
+                    crate::balancer::BALANCER.write().record_attempt_failure_for_generation(
+                        route_generation, dc, "telegram_ws", &domain, attempt_kind
                     );
                 }
             }
