@@ -2494,16 +2494,25 @@ async fn serve_core<R, W>(
         for domain in &domains {
             let url = format!("wss://{}{} via {}", domain, ws_path, target);
             linfo!("[{}] DC{}{} -> {}", label, dc, m_tag, url);
-            let _route_permits = match acquire_route_connect_slot(dc, "telegram_ws", domain).await {
-                Some(permits) => permits,
-                None => continue,
+            let _route_permits = tokio::select! {
+                _ = cancel_token.cancelled() => return,
+                result = acquire_route_connect_slot(dc, "telegram_ws", domain) => match result {
+                    Some(permits) => permits,
+                    None => continue,
+                },
             };
             if !crate::balancer::BALANCER.write().allow_attempt(dc, "telegram_ws", domain) {
                 record_diagnostic(&format!("route_circuit_skip kind=telegram_ws dc={}", dc));
                 continue;
             }
             let route_started = Instant::now();
-            let attempt = ws_connect_full_opts(&target, domain, ws_path, ws_timeout, None, None).await;
+            let attempt = tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    crate::balancer::BALANCER.write().release_attempt(dc, "telegram_ws", domain);
+                    return;
+                }
+                result = ws_connect_full_opts(&target, domain, ws_path, ws_timeout, None, None) => result,
+            };
             match attempt {
                 Ok(ws) => {
                     record_diagnostic(&format!("ws_direct_connect_ok dc={} media={}", dc, is_media as u8));
