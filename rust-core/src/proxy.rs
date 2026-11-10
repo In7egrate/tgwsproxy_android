@@ -3,7 +3,9 @@ use crate::config::*;
 use crate::crypto::*;
 use crate::faketls;
 use crate::ws::*;
+use crate::balancer::{RouteAttemptKind, RouteObservation};
 use crate::{ldebug, linfo, lwarn};
+use once_cell::sync::Lazy;
 use byteorder::{ByteOrder, LittleEndian};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -24,6 +26,14 @@ use tokio_util::sync::CancellationToken;
 
 static TRY_FRONTING_FIRST: AtomicBool = AtomicBool::new(true);
 static NEXT_WS_SESSION_ID: AtomicI64 = AtomicI64::new(1);
+// Bound simultaneous direct Telegram WS dials across all client sessions.
+// Per-route breaker permits below serialize attempts to the same DC/hostname.
+static DIRECT_WS_DIALS: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(4)));
+
+fn try_direct_ws_dial_slot() -> Option<OwnedSemaphorePermit> {
+    DIRECT_WS_DIALS.clone().try_acquire_owned().ok()
+}
 
 pub fn ws_pool_fronting_first() -> bool {
     TRY_FRONTING_FIRST.load(Ordering::Relaxed)
@@ -1138,6 +1148,8 @@ pub async fn bridge_ws<R, W>(
     let session_id = NEXT_WS_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let ws = Arc::new(ws);
     let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
+    let route_observation = Arc::new(Mutex::new(route_observation));
+    let first_request_at = Arc::new(Mutex::new(None::<Instant>));
     // A CancellationToken is level-triggered: if one relay direction exits
     // before the other starts waiting, cancellation is still observed.
     // Notify::notify_waiters() was edge-triggered and could be missed here,
@@ -1203,6 +1215,7 @@ pub async fn bridge_ws<R, W>(
     let up_packets = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let up_bytes_c = up_bytes.clone();
     let up_packets_c = up_packets.clone();
+    let first_request_up = first_request_at.clone();
     let close_reason_up = Arc::new(Mutex::new(String::new()));
     let close_reason_up_c = close_reason_up.clone();
     let up_task = tokio::spawn(async move {
@@ -1257,23 +1270,32 @@ pub async fn bridge_ws<R, W>(
             clt_dec.xor(chunk);
             tg_enc.xor(chunk);
 
-            let send_err = {
+            let (send_err, sent_payload) = {
                 if let Some(sp) = splitter.as_mut() {
                     let parts = sp.split(chunk);
                     if parts.len() > 1 {
-                        ws_up.send_batch(&parts).await.is_err()
+                        let failed = ws_up.send_batch(&parts).await.is_err();
+                        (failed, !failed)
                     } else if parts.len() == 1 {
-                        ws_up.send(&parts[0]).await.is_err()
+                        let failed = ws_up.send(&parts[0]).await.is_err();
+                        (failed, !failed)
                     } else {
-                        false
+                        (false, false)
                     }
                 } else {
-                    ws_up.send(chunk).await.is_err()
+                    let failed = ws_up.send(chunk).await.is_err();
+                    (failed, !failed)
                 }
             };
             if send_err {
                 *close_reason_up_c.lock().await = "upstream: send_failed".to_string();
                 break;
+            }
+            if sent_payload {
+                let mut first = first_request_up.lock().await;
+                if first.is_none() {
+                    *first = Some(Instant::now());
+                }
             }
         }
         let reason = close_reason_up_c.lock().await.clone();
@@ -1294,6 +1316,8 @@ pub async fn bridge_ws<R, W>(
     let down_packets = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let down_bytes_c = down_bytes.clone();
     let down_packets_c = down_packets.clone();
+    let route_observation_down = route_observation.clone();
+    let first_request_down = first_request_at.clone();
     let close_reason_down = Arc::new(Mutex::new(String::new()));
     let close_reason_down_c = close_reason_down.clone();
     let down_task = tokio::spawn(async move {
@@ -1334,6 +1358,28 @@ pub async fn bridge_ws<R, W>(
                 }
             };
             let n = data.len();
+            if n > 0 {
+                let observation = route_observation_down.lock().await.take();
+                if let Some(observation) = observation {
+                    let elapsed = first_request_down
+                        .lock()
+                        .await
+                        .map(|started| started.elapsed())
+                        .unwrap_or_else(|| observation.connected_at.elapsed());
+                    crate::balancer::BALANCER.write().record_first_byte_success(
+                        observation.dc_id,
+                        &observation.route_kind,
+                        &observation.route,
+                        elapsed,
+                    );
+                    record_diagnostic(&format!(
+                        "route_first_byte dc={} kind={} latency_ms={}",
+                        observation.dc_id,
+                        observation.route_kind,
+                        elapsed.as_millis()
+                    ));
+                }
+            }
             STATS.bytes_down.fetch_add(n as i64, Ordering::Relaxed);
             if is_media { STATS.media_bytes_down.fetch_add(n as i64, Ordering::Relaxed); }
             down_bytes_c.fetch_add(n as i64, Ordering::Relaxed);
@@ -1375,6 +1421,34 @@ pub async fn bridge_ws<R, W>(
             "normal".to_string()
         }
     };
+    if let Some(observation) = route_observation.lock().await.take() {
+        let request_was_sent = first_request_at.lock().await.is_some();
+        let upstream_failed = close_reason.starts_with("upstream:")
+            && close_reason != "upstream: canceled";
+        let send_failed = close_reason.contains("send_failed");
+        if (request_was_sent && upstream_failed) || send_failed {
+            crate::balancer::BALANCER.write().record_early_failure(
+                observation.dc_id,
+                &observation.route_kind,
+                &observation.route,
+            );
+            record_diagnostic(&format!(
+                "route_probe_failed dc={} kind={} reason=early_close",
+                observation.dc_id, observation.route_kind
+            ));
+        } else {
+            crate::balancer::BALANCER.write().release_probe(
+                observation.dc_id,
+                &observation.route_kind,
+                &observation.route,
+                observation.attempt_kind,
+            );
+            record_diagnostic(&format!(
+                "route_probe_neutral dc={} kind={} reason={}",
+                observation.dc_id, observation.route_kind, close_reason
+            ));
+        }
+    }
     let elapsed = now_monotonic() - start;
     record_diagnostic(&format!(
         "ws_session_end session={} dc={} media={} reason={} duration_ms={} up_bytes={} down_bytes={}",
@@ -1448,6 +1522,7 @@ pub async fn bridge_tcp<CR, CW>(
     tg_enc: TrackedStream,
     tg_dec: TrackedStream,
     cancel_token: CancellationToken,
+    route_observation: Option<RouteObservation>,
 ) where
     CR: AsyncReadExt + Unpin + Send + 'static,
     CW: AsyncWriteExt + Unpin + Send + 'static,
