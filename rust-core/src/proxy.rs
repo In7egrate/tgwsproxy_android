@@ -1146,6 +1146,7 @@ pub async fn bridge_ws<R, W>(
     mut tg_enc: TrackedStream,
     mut tg_dec: TrackedStream,
     cancel_token: CancellationToken,
+    route_observation: Option<RouteObservation>,
 ) where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
