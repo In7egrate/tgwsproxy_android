@@ -2316,6 +2316,7 @@ where
             .await;
         let mut worker_observation: Option<RouteObservation> = None;
         let worker_ws = if let Some((ws, worker_domain)) = pooled {
+            let route_generation = crate::balancer::BALANCER.read().generation();
             let attempt_kind = crate::balancer::BALANCER
                 .write()
                 .begin_attempt(dc, "cf_worker", &worker_domain);
@@ -2327,6 +2328,7 @@ where
                     route: worker_domain.clone(),
                     attempt_kind,
                     connected_at: Instant::now(),
+                    generation: route_generation,
                 });
                 linfo!(
                     "[{}] DC{}{} -> CF worker pool hit via {} for {}",
@@ -2345,6 +2347,7 @@ where
             let path = format!("/apiws?{}", query);
             let mut found = None;
             for worker_domain in pools.cf_worker.available_domains(dc, worker_domains.clone()).await {
+                let route_generation = crate::balancer::BALANCER.read().generation();
                 let attempt_kind = match crate::balancer::BALANCER
                     .write()
                     .begin_attempt(dc, "cf_worker", &worker_domain)
@@ -2389,6 +2392,16 @@ where
                         Some(secure),
                     ) => result,
                 };
+                if crate::balancer::BALANCER.read().generation() != route_generation {
+                    if let Ok(stale_ws) = attempt {
+                        stale_ws.close().await;
+                    }
+                    crate::balancer::BALANCER.write().cancel_attempt(
+                        dc, "cf_worker", &worker_domain, attempt_kind
+                    );
+                    record_diagnostic("cf_worker_result_ignored reason=network_generation_changed");
+                    return false;
+                }
                 match &attempt {
                     Ok(_) => crate::balancer::BALANCER.write().record_connect_success(
                         dc, "cf_worker", &worker_domain, route_started.elapsed(), attempt_kind
@@ -2408,6 +2421,7 @@ where
                             route: worker_domain.clone(),
                             attempt_kind,
                             connected_at: route_started,
+                            generation: route_generation,
                         });
                         found = Some(ws);
                         break;
