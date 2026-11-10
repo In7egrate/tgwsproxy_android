@@ -1467,12 +1467,14 @@ pub async fn bridge_ws<R, W>(
         let up_r = close_reason_up.lock().await.clone();
         let down_r = close_reason_down.lock().await.clone();
         let ping_r = close_reason_ping.lock().await.clone();
-        if !down_r.is_empty() {
+        if !down_r.is_empty() && down_r != "upstream: canceled" {
             down_r
-        } else if !up_r.is_empty() {
-            up_r
         } else if !ping_r.is_empty() {
             ping_r
+        } else if !up_r.is_empty() {
+            up_r
+        } else if !down_r.is_empty() {
+            down_r
         } else {
             "normal".to_string()
         }
