@@ -304,8 +304,9 @@ impl WsPool {
         while closing.join_next().await.is_some() {}
 
         if self.generation.load(Ordering::Acquire) != generation {
-            if let Some(socket) = ws.take() {
+            if let Some((socket, route)) = ws.take() {
                 socket.close().await;
+                crate::balancer::BALANCER.write().release_validation(dc, "telegram_ws", &route);
             }
             return None;
         }
