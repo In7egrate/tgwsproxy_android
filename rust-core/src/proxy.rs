@@ -1361,10 +1361,11 @@ pub async fn bridge_ws<R, W>(
             if n > 0 {
                 let observation = route_observation_down.lock().await.take();
                 if let Some(observation) = observation {
-                    let elapsed = first_request_down
-                        .lock()
-                        .await
-                        .map(|started| started.elapsed())
+                    let request_elapsed = {
+                        let first_request = first_request_down.lock().await;
+                        first_request.as_ref().map(|started| started.elapsed())
+                    };
+                    let elapsed = request_elapsed
                         .unwrap_or_else(|| observation.connected_at.elapsed());
                     crate::balancer::BALANCER.write().record_first_byte_success(
                         observation.dc_id,
@@ -1505,6 +1506,7 @@ pub async fn bridge_ws_stream(
         tg_enc,
         tg_dec,
         cancel_token,
+        None,
     )
     .await;
 }
@@ -1984,7 +1986,8 @@ where
                     clt_enc.clone_state(),
                     tg_enc.clone_state(),
                     tg_dec.clone_state(),
-                cancel_token,
+                    cancel_token,
+                    None,
                 )
                 .await;
                 return true;
@@ -2017,6 +2020,7 @@ where
                     tg_enc.clone_state(),
                     tg_dec.clone_state(),
                     cancel_token,
+                    None,
                 )
                 .await;
                 return true;
@@ -2669,6 +2673,7 @@ async fn serve_core<R, W>(
         tg_encryptor,
         tg_decryptor,
         cancel_token,
+        None,
     )
     .await;
 }
