@@ -292,6 +292,27 @@ impl Balancer {
         }
     }
 
+    pub fn cancel_attempt(
+        &mut self,
+        dc_id: i32,
+        route_kind: &str,
+        route: &str,
+        attempt: RouteAttemptKind,
+    ) {
+        let key = Self::metric_key(dc_id, route_kind, route);
+        if let Some(metric) = self.route_metrics.get_mut(&key) {
+            match attempt {
+                RouteAttemptKind::Closed => {
+                    metric.in_flight_dials = metric.in_flight_dials.saturating_sub(1);
+                }
+                RouteAttemptKind::HalfOpen => {
+                    metric.half_open_probe_in_flight = false;
+                }
+            }
+            metric.last_updated = Instant::now();
+        }
+    }
+
     /// A connection that passed the handshake but failed before its first
     /// upstream application response is still a route failure.
     pub fn record_early_failure(&mut self, dc_id: i32, route_kind: &str, route: &str) {
