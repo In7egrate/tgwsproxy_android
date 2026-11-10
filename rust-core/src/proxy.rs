@@ -1952,7 +1952,7 @@ where
                 "[{}] DC{}{} -> CF worker pool hit via {} for {}",
                 label, dc, m_tag, worker_domain, fallback_dst
             );
-            Some(ws)
+            Some((ws, worker_domain, Instant::now()))
         } else {
             let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
             let query = format!("dst={}&dc={}", fallback_dst, dc);
@@ -1963,6 +1963,14 @@ where
                     "[{}] DC{}{} -> trying CF worker {} for {}",
                     label, dc, m_tag, worker_domain, fallback_dst
                 );
+                let _route_permits = match acquire_route_connect_slot(dc, "cf_worker", &worker_domain).await {
+                    Some(permits) => permits,
+                    None => continue,
+                };
+                if !crate::balancer::BALANCER.write().allow_attempt(dc, "cf_worker", &worker_domain) {
+                    record_diagnostic(&format!("route_circuit_skip kind=cf_worker dc={}", dc));
+                    continue;
+                }
                 let route_started = Instant::now();
                 let attempt = ws_connect_full_opts(
                     &worker_domain,
@@ -1973,22 +1981,18 @@ where
                     Some(secure),
                 )
                 .await;
-                if attempt.is_ok() {
-                    crate::balancer::BALANCER.write().record_success(
-                        dc, "cf_worker", &worker_domain, route_started.elapsed()
-                    );
-                } else {
-                    crate::balancer::BALANCER.write().record_failure(
-                        dc, "cf_worker", &worker_domain
-                    );
-                }
                 match attempt {
                     Ok(ws) => {
-                        found = Some(ws);
+                        found = Some((ws, worker_domain, route_started));
                         break;
                     }
                     Err(exc) => {
-                        pools.cf_worker.report_failure(&worker_domain, &exc).await;
+                        if matches!(&exc, WsError::Canceled) {
+                            crate::balancer::BALANCER.write().release_attempt(dc, "cf_worker", &worker_domain);
+                        } else {
+                            crate::balancer::BALANCER.write().record_failure(dc, "cf_worker", &worker_domain);
+                            pools.cf_worker.report_failure(&worker_domain, &exc).await;
+                        }
                         lwarn!(
                             "[{}] DC{}{} CF worker {} failed: {}",
                             label, dc, m_tag, worker_domain, exc.compact()
@@ -1998,7 +2002,7 @@ where
             }
             found
         };
-        if let Some(ws) = worker_ws {
+        if let Some((ws, worker_domain, route_started)) = worker_ws {
             STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
             if ws.send(relay_init).await.is_ok() {
                 bridge_ws(
@@ -2013,11 +2017,18 @@ where
                     clt_enc.clone_state(),
                     tg_enc.clone_state(),
                     tg_dec.clone_state(),
-                cancel_token,
+                    Some(RouteObservation {
+                        dc,
+                        kind: "cf_worker",
+                        route: worker_domain,
+                        started: route_started,
+                    }),
+                    cancel_token,
                 )
                 .await;
                 return true;
             }
+            crate::balancer::BALANCER.write().record_failure(dc, "cf_worker", &worker_domain);
             ws.close().await;
             // send failed — падаем сквозь к CF/TCP на тех же halves.
         }
