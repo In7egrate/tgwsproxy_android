@@ -980,7 +980,10 @@ impl CfWorkerPool {
             match ws_connect_full_opts(&worker_domain, &worker_domain, &path, 8.0, None, Some(secure))
                 .await
             {
-                Ok(ws) => return Some((ws, worker_domain)),
+                Ok(ws) => {
+                    crate::balancer::BALANCER.write().mark_pending_validation(dc, "cf_worker", &worker_domain);
+                    return Some((ws, worker_domain));
+                }
                 Err(exc) => {
                     if matches!(&exc, WsError::Canceled) {
                         crate::balancer::BALANCER.write().release_attempt(dc, "cf_worker", &worker_domain);
@@ -1893,6 +1896,9 @@ async fn try_cfproxy_base_domain(
     } else {
         ldebug!(" CF ok {} via hostname", domain);
     }
+    if ws.is_some() {
+        crate::balancer::BALANCER.write().mark_pending_validation(dc, "cf_proxy", &base_domain);
+    }
     (ws, base_domain, Some(route_started))
 }
 
@@ -2085,6 +2091,7 @@ where
                 .await;
                 match attempt {
                     Ok(ws) => {
+                        crate::balancer::BALANCER.write().mark_pending_validation(dc, "cf_worker", &worker_domain);
                         found = Some((ws, worker_domain, route_started));
                         break;
                     }
@@ -2616,6 +2623,7 @@ async fn serve_core<R, W>(
             };
             match attempt {
                 Ok(ws) => {
+                    crate::balancer::BALANCER.write().mark_pending_validation(dc, "telegram_ws", domain);
                     record_diagnostic(&format!("ws_direct_connect_ok dc={} media={}", dc, is_media as u8));
                     all_redirects = false;
                     ws_opt = Some((ws, domain.clone(), route_started));
@@ -2891,7 +2899,10 @@ pub async fn connect_direct_ws(
             result = ws_connect_full_opts(target, domain, ws_path, timeout, None, None) => result,
         };
         match attempt {
-            Ok(ws) => return (Some((ws, domain.clone(), started)), ws_failed_redirect, false),
+            Ok(ws) => {
+                crate::balancer::BALANCER.write().mark_pending_validation(dc, "telegram_ws", domain);
+                return (Some((ws, domain.clone(), started)), ws_failed_redirect, false);
+            }
             Err(WsError::Handshake(handshake)) => {
                 crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", domain);
                 STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
