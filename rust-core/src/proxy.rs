@@ -2416,7 +2416,7 @@ where
                     Err(_) => crate::balancer::BALANCER.write().record_attempt_failure_for_generation(
                         route_generation, dc, "cf_worker", &worker_domain, attempt_kind
                     ),
-                }
+                };
                 match attempt {
                     Ok(ws) => {
                         worker_observation = Some(RouteObservation {
@@ -3054,7 +3054,7 @@ async fn serve_core<R, W>(
                 Err(_) => crate::balancer::BALANCER.write().record_attempt_failure_for_generation(
                     route_generation, dc, "telegram_ws", domain, attempt_kind
                 ),
-            }
+            };
             match attempt {
                 Ok(ws) => {
                     route_observation = Some(RouteObservation {
@@ -3379,7 +3379,7 @@ pub async fn connect_direct_ws(
             Err(_) => crate::balancer::BALANCER.write().record_attempt_failure_for_generation(
                 route_generation, dc, "telegram_ws", dom, attempt_kind
             ),
-        }
+        };
         match attempt {
             Ok(ws) => {
                 let observation = RouteObservation {
