@@ -1021,6 +1021,7 @@ pub async fn connect_one_ws_full(
 
         if fronting_first {
             if let Some(ws) = connect_fronted(ip, domain, path).await {
+                crate::balancer::BALANCER.write().mark_pending_validation(dc, "telegram_ws", domain);
                 return Some((ws, domain.clone()));
             }
         }
@@ -1028,12 +1029,14 @@ pub async fn connect_one_ws_full(
         match ws_connect_full_opts(ip, domain, path, timeout, None, Some(true)).await {
             Ok(ws) => {
                 crate::proxy::set_ws_pool_fronting_first(false);
+                crate::balancer::BALANCER.write().mark_pending_validation(dc, "telegram_ws", domain);
                 return Some((ws, domain.clone()));
             }
             Err(error) => {
                 let retry_fronted = matches!(&error, WsError::Timeout | WsError::Io(_));
                 if retry_fronted && !fronting_first {
                     if let Some(ws) = connect_fronted(ip, domain, path).await {
+                        crate::balancer::BALANCER.write().mark_pending_validation(dc, "telegram_ws", domain);
                         return Some((ws, domain.clone()));
                     }
                 }
