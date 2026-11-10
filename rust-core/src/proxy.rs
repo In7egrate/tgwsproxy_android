@@ -2404,7 +2404,7 @@ async fn serve_core<R, W>(
 
     // Fallback если DC нет в конфиге, WS в чёрном списке или IP на cooldown —
     // порт ветки из _handle_client оригинала.
-    let mut pooled_ws: Option<RawWebSocket> = None;
+    let mut pooled_ws: Option<(RawWebSocket, String, Instant)> = None;
     let mut use_pooled_direct = false;
     if !dc_configured || blacklisted || (ip_cooldown_active && is_any_cf_fallback) {
         if !dc_configured {
@@ -2418,7 +2418,8 @@ async fn serve_core<R, W>(
                 pooled_ws = pools
                     .ws
                     .get(dc, is_media, target.clone(), domains)
-                    .await;
+                    .await
+                    .map(|(ws, route)| (ws, route, Instant::now()));
             }
             if pooled_ws.is_none() {
                 linfo!(
@@ -2482,7 +2483,8 @@ async fn serve_core<R, W>(
         ws_opt = pools
             .ws
             .get(dc, is_media, target.clone(), domains.clone())
-            .await;
+            .await
+            .map(|(ws, route)| (ws, route, Instant::now()));
         if ws_opt.is_some() {
             linfo!("[{}] DC{}{} -> pool hit via {}", label, dc, m_tag, target);
         }
@@ -2492,23 +2494,25 @@ async fn serve_core<R, W>(
         for domain in &domains {
             let url = format!("wss://{}{} via {}", domain, ws_path, target);
             linfo!("[{}] DC{}{} -> {}", label, dc, m_tag, url);
+            let _route_permits = match acquire_route_connect_slot(dc, "telegram_ws", domain).await {
+                Some(permits) => permits,
+                None => continue,
+            };
+            if !crate::balancer::BALANCER.write().allow_attempt(dc, "telegram_ws", domain) {
+                record_diagnostic(&format!("route_circuit_skip kind=telegram_ws dc={}", dc));
+                continue;
+            }
             let route_started = Instant::now();
             let attempt = ws_connect_full_opts(&target, domain, ws_path, ws_timeout, None, None).await;
-            if attempt.is_ok() {
-                crate::balancer::BALANCER.write().record_success(
-                    dc, "telegram_ws", domain, route_started.elapsed()
-                );
-            } else {
-                crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", domain);
-            }
             match attempt {
                 Ok(ws) => {
                     record_diagnostic(&format!("ws_direct_connect_ok dc={} media={}", dc, is_media as u8));
                     all_redirects = false;
-                    ws_opt = Some(ws);
+                    ws_opt = Some((ws, domain.clone(), route_started));
                     break;
                 }
                 Err(WsError::Handshake(h)) if h.is_redirect() => {
+                    crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", domain);
                     all_ws_attempts_timed_out = false;
                     record_diagnostic(&format!("ws_direct_connect_fail dc={} media={} reason=redirect status={}", dc, is_media as u8, h.status_code));
                     STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
@@ -2525,6 +2529,7 @@ async fn serve_core<R, W>(
                     continue;
                 }
                 Err(WsError::Handshake(h)) => {
+                    crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", domain);
                     all_ws_attempts_timed_out = false;
                     record_diagnostic(&format!("ws_direct_connect_fail dc={} media={} reason=handshake status={}", dc, is_media as u8, h.status_code));
                     STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
@@ -2536,6 +2541,7 @@ async fn serve_core<R, W>(
                     continue;
                 }
                 Err(WsError::Timeout) => {
+                    crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", domain);
                     record_diagnostic(&format!("ws_direct_connect_fail dc={} media={} reason=timeout", dc, is_media as u8));
                     STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
                     ws_timed_out = true;
@@ -2550,6 +2556,11 @@ async fn serve_core<R, W>(
                     continue;
                 }
                 Err(exc) => {
+                    if matches!(&exc, WsError::Canceled) {
+                        crate::balancer::BALANCER.write().release_attempt(dc, "telegram_ws", domain);
+                    } else {
+                        crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", domain);
+                    }
                     all_ws_attempts_timed_out = false;
                     record_diagnostic(&format!("ws_direct_connect_fail dc={} media={} reason={}", dc, is_media as u8, match &exc { WsError::Canceled => "canceled", WsError::Io(_) => "io", WsError::Timeout => "timeout", WsError::Handshake(_) => "handshake", WsError::Other(_) => "other" }));
                     STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
@@ -2631,12 +2642,13 @@ async fn serve_core<R, W>(
     }
 
     // send direct init (с retry на свежий WS как мобильное улучшение).
-    let mut ws = ws_opt.take().unwrap();
+    let (mut ws, mut selected_route, mut selected_started) = ws_opt.take().unwrap();
     let mut send_ok = ws.send(&relay_init).await.is_ok();
     if send_ok {
         ldebug!(" direct relayInit sent DC{}{}", dc, m_tag);
     } else {
         lwarn!(" direct relayInit write fail DC{}{}: closed", dc, m_tag);
+        crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", &selected_route);
         ws.close().await;
 
         DC_FAIL_UNTIL.write().insert(dc_key, now + DC_FAIL_COOLDOWN);
@@ -2671,8 +2683,9 @@ async fn serve_core<R, W>(
                 .await;
                 return;
             }
-            Some(rws) => {
+            Some((rws, retry_route, retry_started)) => {
                 if rws.send(&relay_init).await.is_err() {
+                    crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", &retry_route);
                     lwarn!(" direct relayInit write fail DC{}{}: closed", dc, m_tag);
                     rws.close().await;
                     lwarn!(" direct fallback DC{}{}", dc, m_tag);
@@ -2697,6 +2710,8 @@ async fn serve_core<R, W>(
                     return;
                 }
                 ws = rws;
+                selected_route = retry_route;
+                selected_started = retry_started;
                 send_ok = true;
             }
         }
@@ -2716,6 +2731,12 @@ async fn serve_core<R, W>(
         clt_encryptor,
         tg_encryptor,
         tg_decryptor,
+        Some(RouteObservation {
+            dc,
+            kind: "telegram_ws",
+            route: selected_route,
+            started: selected_started,
+        }),
         cancel_token,
     )
     .await;
