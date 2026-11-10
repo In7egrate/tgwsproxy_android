@@ -35,8 +35,11 @@ pub struct RouteObservation {
 struct RouteMetric {
     connect_latency_ewma_ms: f64,
     first_byte_latency_ewma_ms: f64,
+    ping_rtt_ewma_ms: f64,
     connect_samples: u64,
     first_byte_samples: u64,
+    ping_samples: u64,
+    ping_timeouts: u64,
     success_ewma: f64,
     samples: u64,
     consecutive_failures: u32,
@@ -51,8 +54,11 @@ impl Default for RouteMetric {
         Self {
             connect_latency_ewma_ms: 1_000.0,
             first_byte_latency_ewma_ms: 1_000.0,
+            ping_rtt_ewma_ms: 1_000.0,
             connect_samples: 0,
             first_byte_samples: 0,
+            ping_samples: 0,
+            ping_timeouts: 0,
             success_ewma: 0.5,
             samples: 0,
             consecutive_failures: 0,
@@ -269,6 +275,32 @@ impl Balancer {
         metric.half_open_probe_in_flight = false;
     }
 
+    pub fn record_ping_success(
+        &mut self,
+        dc_id: i32,
+        route_kind: &str,
+        route: &str,
+        rtt: Duration,
+    ) {
+        let key = Self::metric_key(dc_id, route_kind, route);
+        let metric = self.metric_mut(key);
+        metric.last_updated = Instant::now();
+        let sample_ms = (rtt.as_secs_f64() * 1_000.0).clamp(1.0, 120_000.0);
+        metric.ping_rtt_ewma_ms = if metric.ping_samples == 0 {
+            sample_ms
+        } else {
+            EWMA_ALPHA * sample_ms + (1.0 - EWMA_ALPHA) * metric.ping_rtt_ewma_ms
+        };
+        metric.ping_samples = metric.ping_samples.saturating_add(1);
+    }
+
+    pub fn record_ping_failure(&mut self, dc_id: i32, route_kind: &str, route: &str) {
+        let key = Self::metric_key(dc_id, route_kind, route);
+        let metric = self.metric_mut(key);
+        metric.ping_timeouts = metric.ping_timeouts.saturating_add(1);
+        self.record_failure(dc_id, route_kind, route);
+    }
+
     /// Compatibility wrapper for existing callers; route success now means
     /// a first upstream application byte, not a successful handshake.
     pub fn record_success(
@@ -407,7 +439,11 @@ impl Balancer {
         }
 
         let latency_score = if metric.first_byte_samples > 0 {
-            metric.first_byte_latency_ewma_ms
+            if metric.ping_samples > 0 {
+                0.7 * metric.first_byte_latency_ewma_ms + 0.3 * metric.ping_rtt_ewma_ms
+            } else {
+                metric.first_byte_latency_ewma_ms
+            }
         } else if metric.connect_samples > 0 {
             // A fast handshake without any successful application response
             // is not a healthy route. Keep it behind routes with real probes.
@@ -456,6 +492,9 @@ impl Balancer {
                     "first_byte_samples": metric.first_byte_samples,
                     "connect_latency_ewma_ms": metric.connect_latency_ewma_ms.round() as u64,
                     "first_byte_latency_ewma_ms": metric.first_byte_latency_ewma_ms.round() as u64,
+                    "ping_rtt_ewma_ms": metric.ping_rtt_ewma_ms.round() as u64,
+                    "ping_samples": metric.ping_samples,
+                    "ping_timeouts": metric.ping_timeouts,
                     "latency_ewma_ms": if metric.first_byte_samples > 0 {
                         metric.first_byte_latency_ewma_ms.round() as u64
                     } else {
