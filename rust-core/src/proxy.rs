@@ -1379,6 +1379,11 @@ pub async fn bridge_ws<R, W>(
                         &observation.route,
                         elapsed,
                     );
+                    STATS.first_byte_latency_ms.store(
+                        elapsed.as_millis().min(i64::MAX as u128) as i64,
+                        Ordering::Relaxed,
+                    );
+                    STATS.first_byte_samples.fetch_add(1, Ordering::Relaxed);
                     record_diagnostic(&format!(
                         "route_first_byte dc={} kind={} latency_ms={}",
                         observation.dc_id,
@@ -2151,6 +2156,7 @@ where
                 .await;
                 return true;
             }
+            STATS.route_early_failures.fetch_add(1, Ordering::Relaxed);
             crate::balancer::BALANCER.write().record_early_failure(
                 observation.dc_id, &observation.route_kind, &observation.route
             );
