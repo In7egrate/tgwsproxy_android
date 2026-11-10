@@ -1501,7 +1501,7 @@ async fn bridge_ws<R, W>(
                 close_reason.replace(' ', "_")
             ));
         } else if client_closed_cleanly && !first_byte_recorded.load(Ordering::Acquire) {
-            crate::balancer::BALANCER.write().release_validation(
+            crate::balancer::BALANCER.write().release_attempt(
                 observation.dc,
                 observation.kind,
                 &observation.route,
@@ -1708,7 +1708,7 @@ async fn bridge_tcp<CR, CW>(
                     observation.kind, observation.dc
                 ));
             } else {
-                crate::balancer::BALANCER.write().release_validation(
+                crate::balancer::BALANCER.write().release_attempt(
                     observation.dc,
                     observation.kind,
                     &observation.route,
