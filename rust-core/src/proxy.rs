@@ -1701,10 +1701,11 @@ async fn try_cfproxy_base_domain(
     dc: i32,
     base_domain: &str,
     ws_path: &str,
-) -> (Option<RawWebSocket>, String) {
+    cancel_token: &CancellationToken,
+) -> (Option<RawWebSocket>, String, Option<RouteObservation>) {
     let base_domain = normalize_cf_domain(base_domain);
     if base_domain.is_empty() {
-        return (None, String::new());
+        return (None, String::new(), None);
     }
     let remaining = cfproxy_429_cooldown_remaining(&base_domain);
     if remaining > Duration::ZERO {
@@ -1713,18 +1714,46 @@ async fn try_cfproxy_base_domain(
             base_domain,
             remaining.as_secs_f64().ceil()
         );
-        return (None, String::new());
+        return (None, String::new(), None);
     }
     let _permit = match acquire_cfproxy_attempt_slot().await {
         Some(p) => p,
-        None => return (None, String::new()),
+        None => return (None, String::new(), None),
+    };
+    let attempt_kind = match crate::balancer::BALANCER
+        .write()
+        .begin_attempt(dc, "cf_proxy", &base_domain)
+    {
+        Some(kind) => kind,
+        None => {
+            record_diagnostic("route_circuit_skip kind=cf_proxy");
+            return (None, String::new(), None);
+        }
     };
 
     let domain = format!("kws{}.{}", dc, base_domain);
     ldebug!(" CF try {}", domain);
-
-    let (ws, resolved_ip, err) = cf_connect_domain(&domain, ws_path, 5.0).await;
+    let started = Instant::now();
+    let result = tokio::select! {
+        _ = cancel_token.cancelled() => {
+            crate::balancer::BALANCER.write().cancel_attempt(
+                dc, "cf_proxy", &base_domain, attempt_kind
+            );
+            return (None, String::new(), None);
+        }
+        result = cf_connect_domain(&domain, ws_path, 5.0) => result,
+    };
+    let (ws, resolved_ip, err) = result;
     if let Some(e) = err {
+        if matches!(e, WsError::Canceled) {
+            crate::balancer::BALANCER.write().cancel_attempt(
+                dc, "cf_proxy", &base_domain, attempt_kind
+            );
+        } else {
+            crate::balancer::BALANCER.write().record_attempt_failure(
+                dc, "cf_proxy", &base_domain, attempt_kind
+            );
+        }
         let reason = match &e {
             WsError::Timeout => "timeout",
             WsError::Canceled => "canceled",
@@ -1733,8 +1762,6 @@ async fn try_cfproxy_base_domain(
             WsError::Other(_) => "other",
         };
         record_diagnostic(&format!("cf_connect_fail dc={} reason={}", dc, reason));
-        // Cooldown ставим ТОЛЬКО при HTTP 429, иначе любой reset/timeout
-        // выжигал бы домены и плодил лавину cooldown.
         if is_http_status_error(&e, 429) {
             mark_cfproxy_429_cooldown(&base_domain, &e);
         }
@@ -1746,17 +1773,27 @@ async fn try_cfproxy_base_domain(
         } else {
             log_cf_conn_error(&format!(" CF fail {}: {}", domain, e.compact()), &e);
         }
-        return (None, String::new());
+        return (None, String::new(), None);
     }
 
+    crate::balancer::BALANCER.write().record_connect_success(
+        dc, "cf_proxy", &base_domain, started.elapsed(), attempt_kind
+    );
     clear_cfproxy_429_cooldown(&base_domain);
-    record_diagnostic(&format!("cf_connect_ok dc={}", dc));
+    record_diagnostic(&format!("cf_connect_ok dc={} connect_ms={}", dc, started.elapsed().as_millis()));
     if !resolved_ip.is_empty() {
         ldebug!(" CF ok {} via {}", domain, resolved_ip);
     } else {
         ldebug!(" CF ok {} via hostname", domain);
     }
-    (ws, base_domain)
+    let observation = RouteObservation {
+        dc_id: dc,
+        route_kind: "cf_proxy".to_string(),
+        route: base_domain.clone(),
+        attempt_kind,
+        connected_at: started,
+    };
+    (ws, base_domain, Some(observation))
 }
 
 // Только устанавливает WS-соединение через CF, НЕ трогая conn.
@@ -1765,7 +1802,7 @@ async fn cfproxy_acquire_ws(
     is_media: bool,
     ws_path: &str,
     cancel_token: &CancellationToken,
-) -> Option<(RawWebSocket, String)> {
+) -> Option<(RawWebSocket, String, RouteObservation)> {
     let (enabled, domains) = {
         let cfg = CFPROXY.read();
         (
@@ -1790,10 +1827,8 @@ async fn cfproxy_acquire_ws(
 
     let mut ws: Option<RawWebSocket> = None;
     let mut chosen_domain = String::new();
+    let mut chosen_observation: Option<RouteObservation> = None;
 
-    // Race all candidates (including the preferred domain) with bounded
-    // concurrency. Awaiting JoinHandles in insertion order made a fast later
-    // domain wait behind a slow earlier one.
     let sem = Arc::new(tokio::sync::Semaphore::new(
         CFPROXY_FALLBACK_PARALLEL.max(1).min(ordered.len()),
     ));
@@ -1807,18 +1842,11 @@ async fn cfproxy_acquire_ws(
                 _ = cancel.cancelled() => None,
                 result = async {
                     let _permit = sem.acquire_owned().await.ok()?;
-                    let started = Instant::now();
-                    let (candidate, domain) = try_cfproxy_base_domain(dc, &base_domain, &path).await;
-                    if candidate.is_some() {
-                        crate::balancer::BALANCER.write().record_success(
-                            dc, "cf_proxy", &domain, started.elapsed()
-                        );
-                    } else {
-                        crate::balancer::BALANCER.write().record_failure(
-                            dc, "cf_proxy", &base_domain
-                        );
-                    }
-                    candidate.map(|socket| (socket, domain))
+                    let (candidate, domain, observation) =
+                        try_cfproxy_base_domain(dc, &base_domain, &path, &cancel).await;
+                    candidate.zip(observation).map(|(socket, observation)| {
+                        (socket, domain, observation)
+                    })
                 } => result,
             }
         });
@@ -1834,9 +1862,10 @@ async fn cfproxy_acquire_ws(
             }
             result = attempts.join_next() => {
                 match result {
-                    Some(Ok(Some((candidate, domain)))) => {
+                    Some(Ok(Some((candidate, domain, observation)))) => {
                         ws = Some(candidate);
                         chosen_domain = domain;
+                        chosen_observation = Some(observation);
                         attempts.abort_all();
                         break;
                     }
@@ -1847,11 +1876,15 @@ async fn cfproxy_acquire_ws(
         }
     }
 
-    // Drain completed/cancelled attempts and close any extra socket that had
-    // already completed successfully at the same time as the winner.
     attempts.abort_all();
     while let Some(result) = attempts.join_next().await {
-        if let Ok(Some((extra, _))) = result {
+        if let Ok(Some((extra, _, observation))) = result {
+            crate::balancer::BALANCER.write().release_probe(
+                observation.dc_id,
+                &observation.route_kind,
+                &observation.route,
+                observation.attempt_kind,
+            );
             extra.close().await;
         }
     }
@@ -1859,19 +1892,31 @@ async fn cfproxy_acquire_ws(
         if let Some(socket) = ws.take() {
             socket.close().await;
         }
+        if let Some(observation) = chosen_observation.take() {
+            crate::balancer::BALANCER.write().release_probe(
+                observation.dc_id,
+                &observation.route_kind,
+                &observation.route,
+                observation.attempt_kind,
+            );
+        }
         return None;
     }
 
-    match ws {
-        Some(w) => {
-            if !chosen_domain.is_empty() {
-                if crate::balancer::BALANCER.write().update_domain_for_dc(dc, &chosen_domain) {
-                    linfo!(" CF домен для DC{} -> {}", dc, chosen_domain);
-                }
+    match (ws, chosen_observation) {
+        (Some(w), Some(observation)) => {
+            if !chosen_domain.is_empty()
+                && crate::balancer::BALANCER.write().update_domain_for_dc(dc, &chosen_domain)
+            {
+                linfo!(" CF домен для DC{} -> {}", dc, chosen_domain);
             }
-            Some((w, chosen_domain))
+            Some((w, chosen_domain, observation))
         }
-        None => {
+        (Some(w), None) => {
+            w.close().await;
+            None
+        }
+        _ => {
             lwarn!(" CF fallback DC{}{}: все CF домены недоступны", dc, m_tag);
             None
         }
