@@ -1833,31 +1833,32 @@ async fn cfproxy_acquire_ws(
         CFPROXY_FALLBACK_PARALLEL.max(1).min(ordered.len()),
     ));
     let mut attempts = JoinSet::new();
+    let mut attempt_cancellations = Vec::new();
     for base_domain in ordered.into_iter().filter(|d| !d.is_empty()) {
         let sem = sem.clone();
-        let cancel = cancel_token.clone();
+        let cancel = cancel_token.child_token();
+        attempt_cancellations.push(cancel.clone());
         let path = ws_path.to_string();
         attempts.spawn(async move {
-            tokio::select! {
-                _ = cancel.cancelled() => None,
-                result = async {
-                    let _permit = sem.acquire_owned().await.ok()?;
-                    let (candidate, domain, observation) =
-                        try_cfproxy_base_domain(dc, &base_domain, &path, &cancel).await;
-                    candidate.zip(observation).map(|(socket, observation)| {
-                        (socket, domain, observation)
-                    })
-                } => result,
-            }
+            let _permit = tokio::select! {
+                _ = cancel.cancelled() => return None,
+                result = sem.acquire_owned() => result.ok()?,
+            };
+            let (candidate, domain, observation) =
+                try_cfproxy_base_domain(dc, &base_domain, &path, &cancel).await;
+            candidate.zip(observation).map(|(socket, observation)| {
+                (socket, domain, observation)
+            })
         });
     }
 
     let mut canceled = false;
+    let mut winner_found = false;
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
                 canceled = true;
-                attempts.abort_all();
+                for token in &attempt_cancellations { token.cancel(); }
                 break;
             }
             result = attempts.join_next() => {
@@ -1866,7 +1867,8 @@ async fn cfproxy_acquire_ws(
                         ws = Some(candidate);
                         chosen_domain = domain;
                         chosen_observation = Some(observation);
-                        attempts.abort_all();
+                        winner_found = true;
+                        for token in &attempt_cancellations { token.cancel(); }
                         break;
                     }
                     Some(_) => {}
@@ -1876,7 +1878,9 @@ async fn cfproxy_acquire_ws(
         }
     }
 
-    attempts.abort_all();
+    if !winner_found && !canceled {
+        for token in &attempt_cancellations { token.cancel(); }
+    }
     while let Some(result) = attempts.join_next().await {
         if let Ok(Some((extra, _, observation))) = result {
             crate::balancer::BALANCER.write().release_probe(
