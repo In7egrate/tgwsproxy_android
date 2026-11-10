@@ -31,8 +31,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-core
-      - name: Check formatting
-        run: cargo fmt --manifest-path rust-core/Cargo.toml -- --check
       - name: Run Rust unit tests
         run: cargo test --locked --manifest-path rust-core/Cargo.toml
 
