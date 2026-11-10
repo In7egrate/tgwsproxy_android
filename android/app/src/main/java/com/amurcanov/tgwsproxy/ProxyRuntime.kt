@@ -79,6 +79,10 @@ object ProxyRuntime {
                         " ws_ping_rtt_ms=${stats.optLong("ws_ping_rtt_ms")}" +
                         " ws_ping_samples=${stats.optLong("ws_ping_samples")}" +
                         " ws_ping_timeouts=${stats.optLong("ws_ping_timeouts")}" +
+                        " first_byte_last_ms=${stats.optLong("first_byte_last_ms")}" +
+                        " first_byte_avg_ms=${stats.optLong("first_byte_avg_ms")}" +
+                        " first_byte_count=${stats.optLong("first_byte_count")}" +
+                        " first_byte_failures=${stats.optLong("first_byte_failures")}" +
                         " loop_lag=${stats.optLong("event_loop_lag_ms")}")
                 }
                 delay(2000L)
