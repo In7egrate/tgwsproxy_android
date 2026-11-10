@@ -2310,10 +2310,10 @@ where
             .await;
         let mut worker_observation: Option<RouteObservation> = None;
         let worker_ws = if let Some((ws, worker_domain, pool_route_generation)) = pooled {
-            match crate::balancer::BALANCER
+            let pool_attempt = crate::balancer::BALANCER
                 .write()
-                .begin_attempt_with_generation(dc, "cf_worker", &worker_domain)
-            {
+                .begin_attempt_with_generation(dc, "cf_worker", &worker_domain);
+            match pool_attempt {
                 Some((attempt_kind, route_generation)) if route_generation == pool_route_generation => {
                     STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
                     worker_observation = Some(RouteObservation {
@@ -2862,10 +2862,10 @@ async fn serve_core<R, W>(
                     .get(dc, is_media, target.clone(), domains)
                     .await
                 {
-                    match crate::balancer::BALANCER
+                    let pool_attempt = crate::balancer::BALANCER
                         .write()
-                        .begin_attempt_with_generation(dc, "telegram_ws", &route)
-                    {
+                        .begin_attempt_with_generation(dc, "telegram_ws", &route);
+                    match pool_attempt {
                         Some((attempt_kind, current_generation)) if current_generation == route_generation => {
                             STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
                             pooled_observation = Some(RouteObservation {
@@ -2958,10 +2958,10 @@ async fn serve_core<R, W>(
             .get(dc, is_media, target.clone(), domains.clone())
             .await
         {
-            match crate::balancer::BALANCER
+            let pool_attempt = crate::balancer::BALANCER
                 .write()
-                .begin_attempt_with_generation(dc, "telegram_ws", &route)
-            {
+                .begin_attempt_with_generation(dc, "telegram_ws", &route);
+            match pool_attempt {
                 Some((attempt_kind, current_generation)) if current_generation == route_generation => {
                     STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
                     route_observation = Some(RouteObservation {
