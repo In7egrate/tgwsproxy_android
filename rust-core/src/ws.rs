@@ -1037,7 +1037,7 @@ pub async fn connect_one_ws_full(
                         return Some((ws, domain.clone()));
                     }
                 }
-                if matches!(error, WsError::Canceled) {
+                if matches!(&error, WsError::Canceled) {
                     crate::balancer::BALANCER
                         .write()
                         .release_attempt(dc, "telegram_ws", domain);
