@@ -14,6 +14,7 @@ pub struct Balancer {
     domains: Vec<String>,
     dc_to_domain: HashMap<i32, String>,
     route_metrics: HashMap<(i32, String, String), RouteMetric>,
+    generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +30,9 @@ pub struct RouteObservation {
     pub route: String,
     pub attempt_kind: RouteAttemptKind,
     pub connected_at: Instant,
+    /// Network epoch captured when the route attempt started. Observations
+    /// from sockets created before a handover must not train the new network.
+    pub generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +92,7 @@ impl Balancer {
             domains: Vec::new(),
             dc_to_domain: HashMap::new(),
             route_metrics: HashMap::new(),
+            generation: 0,
         }
     }
 
@@ -406,7 +411,12 @@ impl Balancer {
         }
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn reset_route_metrics(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
         self.route_metrics.clear();
         self.dc_to_domain.clear();
     }
@@ -700,11 +710,13 @@ mod adaptive_route_tests {
     }
 
     #[test]
-    fn reset_clears_network_specific_measurements() {
+    fn reset_clears_network_specific_measurements_and_advances_generation() {
         let mut balancer = Balancer::new();
         balancer.record_success(2, "telegram_ws", "kws2.web.telegram.org", Duration::from_millis(75));
         assert!(balancer.route_score(2, "telegram_ws", "kws2.web.telegram.org") < UNKNOWN_ROUTE_SCORE);
+        let previous_generation = balancer.generation();
         balancer.reset_route_metrics();
+        assert_eq!(balancer.generation(), previous_generation.wrapping_add(1));
         assert_eq!(
             balancer.route_score(2, "telegram_ws", "kws2.web.telegram.org"),
             UNKNOWN_ROUTE_SCORE
