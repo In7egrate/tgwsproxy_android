@@ -2226,7 +2226,8 @@ async fn cfproxy_acquire_ws(
     }
     while let Some(result) = attempts.join_next().await {
         if let Ok(Some((extra, _, observation))) = result {
-            crate::balancer::BALANCER.write().release_probe(
+            crate::balancer::BALANCER.write().release_probe_for_generation(
+                observation.generation,
                 observation.dc_id,
                 &observation.route_kind,
                 &observation.route,
@@ -2240,7 +2241,8 @@ async fn cfproxy_acquire_ws(
             socket.close().await;
         }
         if let Some(observation) = chosen_observation.take() {
-            crate::balancer::BALANCER.write().release_probe(
+            crate::balancer::BALANCER.write().release_probe_for_generation(
+                observation.generation,
                 observation.dc_id,
                 &observation.route_kind,
                 &observation.route,
@@ -3238,11 +3240,12 @@ async fn serve_core<R, W>(
                 if rws.send(&relay_init).await.is_err() {
                     if let Some(observation) = route_observation.take() {
                         STATS.route_early_failures.fetch_add(1, Ordering::Relaxed);
-                        if crate::balancer::BALANCER.read().generation() == observation.generation {
-                            crate::balancer::BALANCER.write().record_early_failure(
-                                observation.dc_id, &observation.route_kind, &observation.route
-                            );
-                        }
+                        crate::balancer::BALANCER.write().record_early_failure_for_generation(
+                            observation.generation,
+                            observation.dc_id,
+                            &observation.route_kind,
+                            &observation.route,
+                        );
                     }
                     lwarn!(" direct relayInit write fail DC{}{}: closed", dc, m_tag);
                     rws.close().await;
