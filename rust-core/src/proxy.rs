@@ -3327,14 +3327,13 @@ pub async fn connect_direct_ws(
     let mut all_redirects = true;
 
     for dom in &candidates {
-        let route_generation = crate::balancer::BALANCER.read().generation();
-        let attempt_kind = match crate::balancer::BALANCER
+        let (attempt_kind, route_generation) = match crate::balancer::BALANCER
             .write()
-            .begin_attempt(dc, "telegram_ws", dom)
+            .begin_attempt_with_generation(dc, "telegram_ws", dom)
         {
-            Some(kind) => {
+            Some((kind, generation)) => {
                 STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
-                kind
+                (kind, generation)
             }
             None => {
                 STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
@@ -3344,8 +3343,8 @@ pub async fn connect_direct_ws(
         let _dial_permit = match try_direct_ws_dial_slot() {
             Some(permit) => permit,
             None => {
-                crate::balancer::BALANCER.write().cancel_attempt(
-                    dc, "telegram_ws", dom, attempt_kind
+                crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                    route_generation, dc, "telegram_ws", dom, attempt_kind
                 );
                 continue;
             }
@@ -3353,8 +3352,8 @@ pub async fn connect_direct_ws(
         let started = Instant::now();
         let attempt = tokio::select! {
             _ = cancel_token.cancelled() => {
-                crate::balancer::BALANCER.write().cancel_attempt(
-                    dc, "telegram_ws", dom, attempt_kind
+                crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                    route_generation, dc, "telegram_ws", dom, attempt_kind
                 );
                 return (None, ws_failed_redirect, false, None);
             }
@@ -3364,21 +3363,21 @@ pub async fn connect_direct_ws(
             if let Ok(stale_ws) = attempt {
                 stale_ws.close().await;
             }
-            crate::balancer::BALANCER.write().cancel_attempt(
-                dc, "telegram_ws", dom, attempt_kind
+            crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                route_generation, dc, "telegram_ws", dom, attempt_kind
             );
             record_diagnostic("ws_direct_retry_ignored reason=network_generation_changed");
             return (None, ws_failed_redirect, false, None);
         }
         match &attempt {
-            Ok(_) => crate::balancer::BALANCER.write().record_connect_success(
-                dc, "telegram_ws", dom, started.elapsed(), attempt_kind
+            Ok(_) => crate::balancer::BALANCER.write().record_connect_success_for_generation(
+                route_generation, dc, "telegram_ws", dom, started.elapsed(), attempt_kind
             ),
             Err(WsError::Canceled) => crate::balancer::BALANCER.write().cancel_attempt(
                 dc, "telegram_ws", dom, attempt_kind
             ),
-            Err(_) => crate::balancer::BALANCER.write().record_attempt_failure(
-                dc, "telegram_ws", dom, attempt_kind
+            Err(_) => crate::balancer::BALANCER.write().record_attempt_failure_for_generation(
+                route_generation, dc, "telegram_ws", dom, attempt_kind
             ),
         }
         match attempt {
