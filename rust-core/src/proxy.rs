@@ -1790,15 +1790,15 @@ async fn try_cfproxy_base_domain(
     }
     let _permit = match acquire_cfproxy_attempt_slot().await {
         Some(p) => p,
-        None => return (None, String::new()),
+        None => return (None, String::new(), None),
     };
     let _route_permits = match acquire_route_connect_slot(dc, "cf_proxy", &base_domain).await {
         Some(permits) => permits,
-        None => return (None, String::new()),
+        None => return (None, String::new(), None),
     };
     if !crate::balancer::BALANCER.write().allow_attempt(dc, "cf_proxy", &base_domain) {
         record_diagnostic(&format!("route_circuit_skip kind=cf_proxy dc={}", dc));
-        return (None, String::new());
+        return (None, String::new(), None);
     }
 
     let domain = format!("kws{}.{}", dc, base_domain);
@@ -1833,7 +1833,7 @@ async fn try_cfproxy_base_domain(
         } else {
             log_cf_conn_error(&format!(" CF fail {}: {}", domain, e.compact()), &e);
         }
-        return (None, String::new());
+        return (None, String::new(), None);
     }
 
     clear_cfproxy_429_cooldown(&base_domain);
