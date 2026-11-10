@@ -25,6 +25,52 @@ use tokio_util::sync::CancellationToken;
 static TRY_FRONTING_FIRST: AtomicBool = AtomicBool::new(true);
 static NEXT_WS_SESSION_ID: AtomicI64 = AtomicI64::new(1);
 
+// Bound concurrent outbound connection handshakes globally and serialize
+// duplicate attempts to the same (DC, route kind, route) key.
+static ROUTE_CONNECT_GLOBAL: once_cell::sync::Lazy<Arc<Semaphore>> =
+    once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(8)));
+static ROUTE_CONNECT_PER_KEY: once_cell::sync::Lazy<
+    parking_lot::Mutex<HashMap<(i32, String, String), Arc<Semaphore>>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+pub(crate) async fn acquire_route_connect_slot(
+    dc: i32,
+    route_kind: &str,
+    route: &str,
+) -> Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+    let key = (
+        dc,
+        route_kind.to_ascii_lowercase(),
+        route.trim().to_ascii_lowercase(),
+    );
+    let per_route = {
+        let mut map = ROUTE_CONNECT_PER_KEY.lock();
+        if map.len() >= 256 {
+            if let Some(stale) = map
+                .iter()
+                .find(|(_, semaphore)| semaphore.available_permits() > 0)
+                .map(|(key, _)| key.clone())
+            {
+                map.remove(&stale);
+            }
+        }
+        map.entry(key)
+            .or_insert_with(|| Arc::new(Semaphore::new(1)))
+            .clone()
+    };
+    let route_permit = per_route.acquire_owned().await.ok()?;
+    let global_permit = ROUTE_CONNECT_GLOBAL.clone().acquire_owned().await.ok()?;
+    Some((global_permit, route_permit))
+}
+
+#[derive(Clone)]
+struct RouteObservation {
+    dc: i32,
+    kind: &'static str,
+    route: String,
+    started: Instant,
+}
+
 pub fn ws_pool_fronting_first() -> bool {
     TRY_FRONTING_FIRST.load(Ordering::Relaxed)
 }
@@ -128,6 +174,7 @@ pub struct DcSlot {
 
 pub struct PoolEntry {
     pub ws: RawWebSocket,
+    pub route: String,
     pub created: f64, // monotonic, как time.monotonic() в оригинале
     // Permit bounds the total number of idle pooled sockets across all DC/media slots.
     _budget_permit: OwnedSemaphorePermit,
@@ -209,7 +256,7 @@ impl WsPool {
         is_media: bool,
         target_ip: String,
         domains: Vec<String>,
-    ) -> Option<RawWebSocket> {
+    ) -> Option<(RawWebSocket, String)> {
         let slot = DcSlot {
             dc,
             is_media: is_media_int(is_media),
@@ -229,7 +276,7 @@ impl WsPool {
         }
         let now = now_monotonic();
 
-        let mut ws: Option<RawWebSocket> = None;
+        let mut ws: Option<(RawWebSocket, String)> = None;
         let mut stale_sockets = Vec::new();
         {
             let mut q = state.queue.lock().await;
@@ -246,7 +293,7 @@ impl WsPool {
                     age,
                     q.len()
                 );
-                ws = Some(entry.ws);
+                ws = Some((entry.ws, entry.route));
                 break;
             }
         }
@@ -378,15 +425,15 @@ impl WsPool {
                     _ = cancel.cancelled() => None,
                     result = connect_one_ws(&target_ip, &domains) => result,
                 };
-                socket.map(|ws| (ws, permit))
+                socket.map(|(ws, route)| (ws, route, permit))
             });
         }
 
         let mut connected = 0;
         // Completion-order handling: a slow TLS attempt cannot hold ready media sockets.
         while let Some(result) = handles.join_next().await {
-            if let Ok(Some((ws, permit))) = result {
-                let mut candidate = Some((ws, permit));
+            if let Ok(Some((ws, route, permit))) = result {
+                let mut candidate = Some((ws, route, permit));
                 {
                     // Lock order matches reset/close_all. If reset advances the
                     // generation while this lock is held, reset drains this entry
@@ -397,10 +444,11 @@ impl WsPool {
                     if is_current {
                         let mut queue = state.queue.lock().await;
                         if queue.len() < 16 {
-                            let (ws, budget_permit) =
+                            let (ws, route, budget_permit) =
                                 candidate.take().expect("candidate socket is present");
                             queue.push_back(PoolEntry {
                                 ws,
+                                route,
                                 created: now_monotonic(),
                                 _budget_permit: budget_permit,
                             });
@@ -408,7 +456,7 @@ impl WsPool {
                         }
                     }
                 }
-                if let Some((socket, budget_permit)) = candidate {
+                if let Some((socket, _route, budget_permit)) = candidate {
                     socket.close().await;
                     drop(budget_permit);
                 }
