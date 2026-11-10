@@ -280,6 +280,21 @@ impl Balancer {
         metric.half_open_probe_in_flight = false;
     }
 
+    pub fn record_first_byte_success_for_generation(
+        &mut self,
+        generation: u64,
+        dc_id: i32,
+        route_kind: &str,
+        route: &str,
+        elapsed: Duration,
+    ) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.record_first_byte_success(dc_id, route_kind, route, elapsed);
+        true
+    }
+
     pub fn record_ping_success(
         &mut self,
         dc_id: i32,
@@ -299,11 +314,40 @@ impl Balancer {
         metric.ping_samples = metric.ping_samples.saturating_add(1);
     }
 
+    pub fn record_ping_success_for_generation(
+        &mut self,
+        generation: u64,
+        dc_id: i32,
+        route_kind: &str,
+        route: &str,
+        rtt: Duration,
+    ) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.record_ping_success(dc_id, route_kind, route, rtt);
+        true
+    }
+
     pub fn record_ping_failure(&mut self, dc_id: i32, route_kind: &str, route: &str) {
         let key = Self::metric_key(dc_id, route_kind, route);
         let metric = self.metric_mut(key);
         metric.ping_timeouts = metric.ping_timeouts.saturating_add(1);
         self.record_failure(dc_id, route_kind, route);
+    }
+
+    pub fn record_ping_failure_for_generation(
+        &mut self,
+        generation: u64,
+        dc_id: i32,
+        route_kind: &str,
+        route: &str,
+    ) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.record_ping_failure(dc_id, route_kind, route);
+        true
     }
 
     /// Compatibility wrapper for existing callers; route success now means
@@ -352,6 +396,21 @@ impl Balancer {
         }
     }
 
+    pub fn release_probe_for_generation(
+        &mut self,
+        generation: u64,
+        dc_id: i32,
+        route_kind: &str,
+        route: &str,
+        attempt: RouteAttemptKind,
+    ) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.release_probe(dc_id, route_kind, route, attempt);
+        true
+    }
+
     pub fn cancel_attempt(
         &mut self,
         dc_id: i32,
@@ -377,6 +436,20 @@ impl Balancer {
     /// upstream application response is still a route failure.
     pub fn record_early_failure(&mut self, dc_id: i32, route_kind: &str, route: &str) {
         self.record_failure(dc_id, route_kind, route);
+    }
+
+    pub fn record_early_failure_for_generation(
+        &mut self,
+        generation: u64,
+        dc_id: i32,
+        route_kind: &str,
+        route: &str,
+    ) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.record_early_failure(dc_id, route_kind, route);
+        true
     }
 
     pub fn record_failure(&mut self, dc_id: i32, route_kind: &str, route: &str) {
