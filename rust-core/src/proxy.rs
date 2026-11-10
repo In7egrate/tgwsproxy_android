@@ -1774,9 +1774,12 @@ async fn try_cfproxy_base_domain(
         );
         return (None, String::new(), None);
     }
-    let _permit = match acquire_cfproxy_attempt_slot().await {
-        Some(p) => p,
-        None => return (None, String::new(), None),
+    let _permit = tokio::select! {
+        _ = cancel_token.cancelled() => return (None, String::new(), None),
+        permit = acquire_cfproxy_attempt_slot() => match permit {
+            Some(p) => p,
+            None => return (None, String::new(), None),
+        },
     };
     let attempt_kind = match crate::balancer::BALANCER
         .write()
