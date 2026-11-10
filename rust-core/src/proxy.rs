@@ -2731,9 +2731,15 @@ pub async fn connect_direct_ws(
     domains: &[String],
     timeout: f64,
     ws_path: &str,
-) -> (Option<RawWebSocket>, bool, bool) {
+    cancel_token: &CancellationToken,
+) -> (
+    Option<RawWebSocket>,
+    bool,
+    bool,
+    Option<RouteObservation>,
+) {
     if domains.is_empty() {
-        return (None, false, false);
+        return (None, false, false, None);
     }
     let candidates = crate::balancer::BALANCER
         .read()
@@ -2742,17 +2748,54 @@ pub async fn connect_direct_ws(
     let mut all_redirects = true;
 
     for dom in &candidates {
+        let attempt_kind = match crate::balancer::BALANCER
+            .write()
+            .begin_attempt(dc, "telegram_ws", dom)
+        {
+            Some(kind) => kind,
+            None => continue,
+        };
+        let _dial_permit = match try_direct_ws_dial_slot() {
+            Some(permit) => permit,
+            None => {
+                crate::balancer::BALANCER.write().cancel_attempt(
+                    dc, "telegram_ws", dom, attempt_kind
+                );
+                continue;
+            }
+        };
         let started = Instant::now();
-        let attempt = ws_connect_full_opts(target, dom, ws_path, timeout, None, None).await;
-        if attempt.is_ok() {
-            crate::balancer::BALANCER.write().record_success(
-                dc, "telegram_ws", dom, started.elapsed()
-            );
-        } else {
-            crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", dom);
+        let attempt = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                crate::balancer::BALANCER.write().cancel_attempt(
+                    dc, "telegram_ws", dom, attempt_kind
+                );
+                return (None, ws_failed_redirect, false, None);
+            }
+            result = ws_connect_full_opts(target, dom, ws_path, timeout, None, None) => result,
+        };
+        match &attempt {
+            Ok(_) => crate::balancer::BALANCER.write().record_connect_success(
+                dc, "telegram_ws", dom, started.elapsed(), attempt_kind
+            ),
+            Err(WsError::Canceled) => crate::balancer::BALANCER.write().cancel_attempt(
+                dc, "telegram_ws", dom, attempt_kind
+            ),
+            Err(_) => crate::balancer::BALANCER.write().record_attempt_failure(
+                dc, "telegram_ws", dom, attempt_kind
+            ),
         }
         match attempt {
-            Ok(ws) => return (Some(ws), ws_failed_redirect, false),
+            Ok(ws) => {
+                let observation = RouteObservation {
+                    dc_id: dc,
+                    route_kind: "telegram_ws".to_string(),
+                    route: dom.clone(),
+                    attempt_kind,
+                    connected_at: started,
+                };
+                return (Some(ws), ws_failed_redirect, false, Some(observation));
+            }
             Err(WsError::Handshake(h)) => {
                 STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
                 if h.is_redirect() {
@@ -2762,10 +2805,11 @@ pub async fn connect_direct_ws(
                 }
             }
             Err(WsError::Timeout) => {
-                // A timeout says nothing about redirect policy; continue with
-                // the next Telegram hostname and never blacklist on this result.
                 STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
                 all_redirects = false;
+            }
+            Err(WsError::Canceled) => {
+                return (None, ws_failed_redirect, false, None);
             }
             Err(_) => {
                 STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
@@ -2773,7 +2817,7 @@ pub async fn connect_direct_ws(
             }
         }
     }
-    (None, ws_failed_redirect, all_redirects)
+    (None, ws_failed_redirect, all_redirects, None)
 }
 
 // ---------------------------------------------------------------------------
