@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -1157,6 +1157,7 @@ pub async fn bridge_ws<R, W>(
     let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
     let route_observation = Arc::new(Mutex::new(route_observation));
     let first_request_at = Arc::new(Mutex::new(None::<Instant>));
+    let first_request_notify = Arc::new(Notify::new());
     // A CancellationToken is level-triggered: if one relay direction exits
     // before the other starts waiting, cancellation is still observed.
     // Notify::notify_waiters() was edge-triggered and could be missed here,
@@ -1223,6 +1224,7 @@ pub async fn bridge_ws<R, W>(
     let up_bytes_c = up_bytes.clone();
     let up_packets_c = up_packets.clone();
     let first_request_up = first_request_at.clone();
+    let first_request_notify_up = first_request_notify.clone();
     let close_reason_up = Arc::new(Mutex::new(String::new()));
     let close_reason_up_c = close_reason_up.clone();
     let up_task = tokio::spawn(async move {
@@ -1302,6 +1304,7 @@ pub async fn bridge_ws<R, W>(
                 let mut first = first_request_up.lock().await;
                 if first.is_none() {
                     *first = Some(Instant::now());
+                    first_request_notify_up.notify_one();
                 }
             }
         }
@@ -1314,8 +1317,28 @@ pub async fn bridge_ws<R, W>(
         cancel_up.cancel();
     });
 
+    // One reader task owns the WS read half. A bounded channel lets the
+    // bridge enforce a first-byte deadline without cancelling a partial frame.
+    let (upstream_tx, mut upstream_rx) =
+        tokio::sync::mpsc::channel::<Result<Vec<u8>, WsError>>(1);
+    let ws_reader = ws.clone();
+    let reader_cancel = session_cancel.clone();
+    let reader_root_cancel = cancel_token.clone();
+    let reader_task = tokio::spawn(async move {
+        loop {
+            let result = tokio::select! {
+                _ = reader_root_cancel.cancelled() => break,
+                _ = reader_cancel.cancelled() => break,
+                result = ws_reader.recv() => result,
+            };
+            let finished = result.is_err();
+            if upstream_tx.send(result).await.is_err() || finished {
+                break;
+            }
+        }
+    });
+
     // down: ws -> client
-    let ws_down = ws.clone();
     let la_down = last_activity.clone();
     let cancel_down = session_cancel.clone();
     let cancel_token_down = cancel_token.clone();
@@ -1325,14 +1348,33 @@ pub async fn bridge_ws<R, W>(
     let down_packets_c = down_packets.clone();
     let route_observation_down = route_observation.clone();
     let first_request_down = first_request_at.clone();
+    let first_request_notify_down = first_request_notify.clone();
     let close_reason_down = Arc::new(Mutex::new(String::new()));
     let close_reason_down_c = close_reason_down.clone();
     let down_task = tokio::spawn(async move {
+        let mut first_byte_deadline: Option<tokio::time::Instant> = None;
         loop {
+            let probe_pending = route_observation_down.lock().await.is_some();
+            if probe_pending && first_byte_deadline.is_none() {
+                let request_started = *first_request_down.lock().await;
+                if let Some(started) = request_started {
+                    first_byte_deadline = Some(tokio::time::Instant::from_std(
+                        started + FIRST_UPSTREAM_BYTE_TIMEOUT
+                    ));
+                }
+            }
+            if !probe_pending {
+                first_byte_deadline = None;
+            }
             let recv_res = tokio::select! {
                 _ = cancel_token_down.cancelled() => break,
                 _ = cancel_down.cancelled() => break,
-                r = ws_down.recv() => r,
+                _ = first_request_notify_down.notified(),
+                    if probe_pending && first_byte_deadline.is_none() => continue,
+                _ = tokio::time::sleep_until(
+                    first_byte_deadline.unwrap_or_else(tokio::time::Instant::now)
+                ), if first_byte_deadline.is_some() => Err(WsError::Timeout),
+                result = upstream_rx.recv() => result.unwrap_or(Err(WsError::Canceled)),
             };
             let mut data = match recv_res {
                 Ok(d) => d,
@@ -1419,6 +1461,7 @@ pub async fn bridge_ws<R, W>(
     let _ = down_task.await;
     session_cancel.cancel();
     ping_task.abort();
+    let _ = reader_task.await;
 
     let close_reason = {
         let up_r = close_reason_up.lock().await.clone();
