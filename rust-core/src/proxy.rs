@@ -1377,24 +1377,59 @@ pub async fn bridge_ws<R, W>(
     let close_reason_down_c = close_reason_down.clone();
     let down_task = tokio::spawn(async move {
         let mut first_byte_deadline: Option<tokio::time::Instant> = None;
+        let mut half_open_release_deadline: Option<tokio::time::Instant> =
+            route_observation_down
+                .lock()
+                .await
+                .as_ref()
+                .filter(|observation| observation.attempt_kind == RouteAttemptKind::HalfOpen)
+                .map(|observation| {
+                    tokio::time::Instant::from_std(
+                        observation.connected_at + HALF_OPEN_PROBE_IDLE_TIMEOUT
+                    )
+                });
         loop {
-            let probe_pending = route_observation_down.lock().await.is_some();
-            if probe_pending && first_byte_deadline.is_none() {
-                let request_started = *first_request_down.lock().await;
+            let observation_pending = route_observation_down.lock().await.is_some();
+            let request_started = *first_request_down.lock().await;
+            if observation_pending {
                 if let Some(started) = request_started {
-                    first_byte_deadline = Some(tokio::time::Instant::from_std(
-                        started + FIRST_UPSTREAM_BYTE_TIMEOUT
-                    ));
+                    if first_byte_deadline.is_none() {
+                        first_byte_deadline = Some(tokio::time::Instant::from_std(
+                            started + FIRST_UPSTREAM_BYTE_TIMEOUT
+                        ));
+                    }
+                    half_open_release_deadline = None;
                 }
-            }
-            if !probe_pending {
+            } else {
                 first_byte_deadline = None;
+                half_open_release_deadline = None;
             }
             let recv_res = tokio::select! {
                 _ = cancel_token_down.cancelled() => break,
                 _ = cancel_down.cancelled() => break,
                 _ = first_request_notify_down.notified(),
-                    if probe_pending && first_byte_deadline.is_none() => continue,
+                    if observation_pending && first_byte_deadline.is_none() => continue,
+                _ = tokio::time::sleep_until(
+                    half_open_release_deadline.unwrap_or_else(tokio::time::Instant::now)
+                ), if half_open_release_deadline.is_some() => {
+                    let probe = route_observation_down.lock().await.as_ref().map(|observation| (
+                        observation.dc_id,
+                        observation.route_kind.clone(),
+                        observation.route.clone(),
+                        observation.attempt_kind,
+                    ));
+                    if let Some((dc_id, route_kind, route, attempt_kind)) = probe {
+                        crate::balancer::BALANCER.write().release_probe(
+                            dc_id, &route_kind, &route, attempt_kind
+                        );
+                        record_diagnostic(&format!(
+                            "route_probe_neutral dc={} kind={} reason=no_client_request",
+                            dc_id, route_kind
+                        ));
+                    }
+                    half_open_release_deadline = None;
+                    continue;
+                },
                 _ = tokio::time::sleep_until(
                     first_byte_deadline.unwrap_or_else(tokio::time::Instant::now)
                 ), if first_byte_deadline.is_some() => Err(WsError::Timeout),
