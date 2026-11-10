@@ -15,8 +15,9 @@ pub const DEFAULT_SEND_BUF: usize = 256 * 1024;
 pub const DEFAULT_POOL_SZ: i32 = 6;
 
 // proxy/tg_ws_proxy.py: IP_FAIL_COOLDOWN / DC_FAIL_COOLDOWN / WS_FAIL_TIMEOUT
-// Keep the upstream direct-IP cooldown unchanged; this patch does not alter route policy.
-pub const IP_FAIL_COOLDOWN: f64 = 3600.0;
+// Mobile routes can recover without a full network handover; keep this target
+// cooldown short and let the per-route circuit breaker control repeated failures.
+pub const IP_FAIL_COOLDOWN: f64 = 60.0;
 pub const DC_FAIL_COOLDOWN: f64 = 60.0;
 pub const WS_FAIL_TIMEOUT: f64 = 2.0;
 // Прямой WS-коннект при отсутствии cooldown — 5.0 как в оригинале.
