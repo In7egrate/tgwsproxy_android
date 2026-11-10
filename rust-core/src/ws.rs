@@ -993,8 +993,10 @@ pub async fn ws_connect_full_opts(
     }
 }
 
-// connectOneWS: перебор доменов (pool refill path, fronting-first как в оригинале)
-pub async fn connect_one_ws(ip: &str, domains: &[String]) -> Option<RawWebSocket> {
+// connectOneWS: перебор доменов (pool refill path, fronting-first как в оригинале).
+// A pooled socket keeps its selected hostname so a later real data exchange can
+// update the same route metric instead of counting the handshake as success.
+pub async fn connect_one_ws(ip: &str, domains: &[String]) -> Option<(RawWebSocket, String)> {
     connect_one_ws_full(ip, domains, WS_PATH, WS_POOL_CONNECT_TIMEOUT).await
 }
 
@@ -1003,37 +1005,56 @@ pub async fn connect_one_ws_full(
     domains: &[String],
     path: &str,
     timeout: f64,
-) -> Option<RawWebSocket> {
-    // Try each Telegram hostname. When fronting-first is enabled, one
-    // fronted attempt precedes the normal SNI attempt; do not repeat the same
-    // fronted attempt after a timeout, and do not abandon the alternate host.
+) -> Option<(RawWebSocket, String)> {
     let fronting_first = crate::proxy::ws_pool_fronting_first();
-    for d in domains {
+    for domain in domains {
+        let _connect_permits =
+            crate::proxy::acquire_route_connect_slot(0, "telegram_ws", domain).await?;
+        if !crate::balancer::BALANCER
+            .write()
+            .allow_attempt(0, "telegram_ws", domain)
+        {
+            crate::config::record_diagnostic("route_circuit_skip kind=telegram_ws dc=0");
+            continue;
+        }
+
         if fronting_first {
-            if let Some(ws) = connect_fronted(ip, d, path).await {
-                return Some(ws);
+            if let Some(ws) = connect_fronted(ip, domain, path).await {
+                return Some((ws, domain.clone()));
             }
         }
-        match ws_connect_full_opts(ip, d, path, timeout, None, Some(true)).await {
+
+        match ws_connect_full_opts(ip, domain, path, timeout, None, Some(true)).await {
             Ok(ws) => {
                 crate::proxy::set_ws_pool_fronting_first(false);
-                return Some(ws);
+                return Some((ws, domain.clone()));
             }
-            Err(WsError::Timeout) | Err(WsError::Io(_)) => {
-                if !fronting_first {
-                    if let Some(ws) = connect_fronted(ip, d, path).await {
-                        return Some(ws);
+            Err(error) => {
+                let retry_fronted = matches!(error, WsError::Timeout | WsError::Io(_));
+                if retry_fronted && !fronting_first {
+                    if let Some(ws) = connect_fronted(ip, domain, path).await {
+                        return Some((ws, domain.clone()));
                     }
                 }
-                // Continue with the alternate Telegram hostname.
-            }
-            Err(WsError::Handshake(h)) => {
-                if !h.is_redirect() {
-                    ldebug!("WS pool handshake rejected for {}: {}", d, h.status_line);
+                if matches!(error, WsError::Canceled) {
+                    crate::balancer::BALANCER
+                        .write()
+                        .release_attempt(0, "telegram_ws", domain);
+                } else {
+                    crate::balancer::BALANCER
+                        .write()
+                        .record_failure(0, "telegram_ws", domain);
                 }
-                continue;
+                if let WsError::Handshake(handshake) = &error {
+                    if !handshake.is_redirect() {
+                        ldebug!(
+                            "WS pool handshake rejected for {}: {}",
+                            domain,
+                            handshake.status_line
+                        );
+                    }
+                }
             }
-            Err(_) => continue,
         }
     }
     None
