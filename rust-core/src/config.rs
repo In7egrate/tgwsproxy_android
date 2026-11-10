@@ -343,6 +343,11 @@ pub struct Stats {
     pub ws_ping_rtt_ms: AtomicI64,
     pub ws_ping_samples: AtomicI64,
     pub ws_ping_timeouts: AtomicI64,
+    pub first_byte_latency_ms: AtomicI64,
+    pub first_byte_samples: AtomicI64,
+    pub route_attempts: AtomicI64,
+    pub route_circuit_skips: AtomicI64,
+    pub route_early_failures: AtomicI64,
     pub media_bytes_up: AtomicI64,
     pub media_bytes_down: AtomicI64,
     pub event_loop_lag_ms: AtomicI64,
@@ -503,6 +508,11 @@ impl Stats {
         self.ws_ping_rtt_ms.store(0, Ordering::Relaxed);
         self.ws_ping_samples.store(0, Ordering::Relaxed);
         self.ws_ping_timeouts.store(0, Ordering::Relaxed);
+        self.first_byte_latency_ms.store(0, Ordering::Relaxed);
+        self.first_byte_samples.store(0, Ordering::Relaxed);
+        self.route_attempts.store(0, Ordering::Relaxed);
+        self.route_circuit_skips.store(0, Ordering::Relaxed);
+        self.route_early_failures.store(0, Ordering::Relaxed);
         self.media_bytes_up.store(0, Ordering::Relaxed);
         self.media_bytes_down.store(0, Ordering::Relaxed);
         self.event_loop_lag_ms.store(0, Ordering::Relaxed);
