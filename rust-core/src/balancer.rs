@@ -473,6 +473,8 @@ impl Balancer {
                     "open"
                 } else if metric.half_open_probe_in_flight {
                     "half_open"
+                } else if metric.cooldown_until.is_some() {
+                    "half_open_ready"
                 } else {
                     "closed"
                 };
