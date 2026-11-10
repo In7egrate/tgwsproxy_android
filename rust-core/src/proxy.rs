@@ -1800,7 +1800,11 @@ where
 
     STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
     if remote.write_all(init).await.is_err() {
-        crate::balancer::BALANCER.write().record_failure(dc, "tcp_fallback", &addr);
+        if cancel_token.is_cancelled() {
+            crate::balancer::BALANCER.write().release_attempt(dc, "tcp_fallback", &addr);
+        } else {
+            crate::balancer::BALANCER.write().record_failure(dc, "tcp_fallback", &addr);
+        }
         record_diagnostic("tcp_fallback_init_write_fail");
         return false;
     }
@@ -2148,7 +2152,11 @@ where
                 .await;
                 return true;
             }
-            crate::balancer::BALANCER.write().record_failure(dc, "cf_worker", &worker_domain);
+            if cancel_token.is_cancelled() {
+                crate::balancer::BALANCER.write().release_attempt(dc, "cf_worker", &worker_domain);
+            } else {
+                crate::balancer::BALANCER.write().record_failure(dc, "cf_worker", &worker_domain);
+            }
             ws.close().await;
             // send failed — падаем сквозь к CF/TCP на тех же halves.
         }
@@ -2187,7 +2195,11 @@ where
                 .await;
                 return true;
             }
-            crate::balancer::BALANCER.write().record_failure(dc, "cf_proxy", &chosen_domain);
+            if cancel_token.is_cancelled() {
+                crate::balancer::BALANCER.write().release_attempt(dc, "cf_proxy", &chosen_domain);
+            } else {
+                crate::balancer::BALANCER.write().record_failure(dc, "cf_proxy", &chosen_domain);
+            }
             ws.close().await;
             // CF умер сразу после handshake — пробуем TCP на том же conn.
         }
@@ -2777,7 +2789,11 @@ async fn serve_core<R, W>(
         ldebug!(" direct relayInit sent DC{}{}", dc, m_tag);
     } else {
         lwarn!(" direct relayInit write fail DC{}{}: closed", dc, m_tag);
-        crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", &selected_route);
+        if cancel_token.is_cancelled() {
+            crate::balancer::BALANCER.write().release_attempt(dc, "telegram_ws", &selected_route);
+        } else {
+            crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", &selected_route);
+        }
         ws.close().await;
 
         DC_FAIL_UNTIL.write().insert(dc_key, now + DC_FAIL_COOLDOWN);
@@ -2814,7 +2830,11 @@ async fn serve_core<R, W>(
             }
             Some((rws, retry_route, retry_started)) => {
                 if rws.send(&relay_init).await.is_err() {
-                    crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", &retry_route);
+                    if cancel_token.is_cancelled() {
+                        crate::balancer::BALANCER.write().release_attempt(dc, "telegram_ws", &retry_route);
+                    } else {
+                        crate::balancer::BALANCER.write().record_failure(dc, "telegram_ws", &retry_route);
+                    }
                     lwarn!(" direct relayInit write fail DC{}{}: closed", dc, m_tag);
                     rws.close().await;
                     lwarn!(" direct fallback DC{}{}", dc, m_tag);
