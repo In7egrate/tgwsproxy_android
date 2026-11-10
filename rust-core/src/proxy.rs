@@ -2460,9 +2460,11 @@ where
             }
             if let Some(observation) = worker_observation.take() {
                 STATS.route_early_failures.fetch_add(1, Ordering::Relaxed);
-                crate::balancer::BALANCER.write().record_early_failure(
-                    observation.dc_id, &observation.route_kind, &observation.route
-                );
+                if crate::balancer::BALANCER.read().generation() == observation.generation {
+                    crate::balancer::BALANCER.write().record_early_failure(
+                        observation.dc_id, &observation.route_kind, &observation.route
+                    );
+                }
             }
             ws.close().await;
         }
