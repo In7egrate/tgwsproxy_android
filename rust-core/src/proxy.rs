@@ -1184,6 +1184,13 @@ pub async fn bridge_ws<R, W>(
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
+    if let Some(observation) = route_observation.as_ref() {
+        crate::balancer::BALANCER.write().mark_pending_validation(
+            observation.dc,
+            observation.kind,
+            &observation.route,
+        );
+    }
     let dc_tag = format!("DC{}{}", dc, if is_media { "m" } else { "" });
     let session_id = NEXT_WS_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let ws = Arc::new(ws);
@@ -1479,6 +1486,12 @@ pub async fn bridge_ws<R, W>(
                 observation.dc,
                 close_reason.replace(' ', "_")
             ));
+        } else if client_closed_cleanly && !first_byte_recorded.load(Ordering::Acquire) {
+            crate::balancer::BALANCER.write().release_validation(
+                observation.dc,
+                observation.kind,
+                &observation.route,
+            );
         }
     }
     record_diagnostic(&format!(
@@ -1559,6 +1572,13 @@ pub async fn bridge_tcp<CR, CW>(
     CR: AsyncReadExt + Unpin + Send + 'static,
     CW: AsyncWriteExt + Unpin + Send + 'static,
 {
+    if let Some(observation) = route_observation.as_ref() {
+        crate::balancer::BALANCER.write().mark_pending_validation(
+            observation.dc,
+            observation.kind,
+            &observation.route,
+        );
+    }
     let (mut r_read, mut r_write) = remote.split();
 
     let clt_dec = Arc::new(Mutex::new(clt_dec));
@@ -1652,6 +1672,15 @@ pub async fn bridge_tcp<CR, CW>(
 
     tokio::join!(up, down);
     session_cancel.cancel();
+    if let Some(observation) = route_observation.as_ref() {
+        if !first_byte_recorded.load(Ordering::Acquire) {
+            crate::balancer::BALANCER.write().release_validation(
+                observation.dc,
+                observation.kind,
+                &observation.route,
+            );
+        }
+    }
     let _ = (clt_dec, clt_enc, tg_enc, tg_dec);
 }
 
