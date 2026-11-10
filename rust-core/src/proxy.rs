@@ -1176,7 +1176,7 @@ pub fn is_http_transport(data: &[u8]) -> bool {
 // Сессионная статистика как в bridge_ws_reencrypt оригинала.
 // ---------------------------------------------------------------------------
 
-pub async fn bridge_ws<R, W>(
+pub(crate) async fn bridge_ws<R, W>(
     conn_read: R,
     conn_write: W,
     ws: RawWebSocket,
@@ -1568,7 +1568,7 @@ pub async fn bridge_ws_stream(
 // Bridge TCP — generic core + wrapper.
 // ---------------------------------------------------------------------------
 
-pub async fn bridge_tcp<CR, CW>(
+pub(crate) async fn bridge_tcp<CR, CW>(
     mut c_read: CR,
     mut c_write: CW,
     mut remote: TcpStream,
