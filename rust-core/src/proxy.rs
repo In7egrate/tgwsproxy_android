@@ -423,7 +423,7 @@ impl WsPool {
                 }
                 let socket = tokio::select! {
                     _ = cancel.cancelled() => None,
-                    result = connect_one_ws(&target_ip, &domains) => result,
+                    result = connect_one_ws(slot.dc, &target_ip, &domains) => result,
                 };
                 socket.map(|(ws, route)| (ws, route, permit))
             });
@@ -1177,6 +1177,7 @@ pub async fn bridge_ws<R, W>(
     mut clt_enc: TrackedStream,
     mut tg_enc: TrackedStream,
     mut tg_dec: TrackedStream,
+    route_observation: Option<RouteObservation>,
     cancel_token: CancellationToken,
 ) where
     R: AsyncReadExt + Unpin + Send + 'static,
@@ -1344,6 +1345,9 @@ pub async fn bridge_ws<R, W>(
     let down_packets_c = down_packets.clone();
     let close_reason_down = Arc::new(Mutex::new(String::new()));
     let close_reason_down_c = close_reason_down.clone();
+    let first_byte_recorded = Arc::new(AtomicBool::new(false));
+    let first_byte_recorded_down = first_byte_recorded.clone();
+    let route_observation_down = route_observation.clone();
     let down_task = tokio::spawn(async move {
         loop {
             let recv_res = tokio::select! {
@@ -1382,6 +1386,27 @@ pub async fn bridge_ws<R, W>(
                 }
             };
             let n = data.len();
+            if n > 0 {
+                if let Some(observation) = route_observation_down.as_ref() {
+                    if !first_byte_recorded_down.swap(true, Ordering::AcqRel) {
+                        let elapsed = observation.started.elapsed();
+                        let elapsed_ms = elapsed.as_millis().min(i64::MAX as u128) as i64;
+                        STATS.first_byte_last_ms.store(elapsed_ms, Ordering::Relaxed);
+                        STATS.first_byte_total_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
+                        STATS.first_byte_count.fetch_add(1, Ordering::Relaxed);
+                        crate::balancer::BALANCER.write().record_success(
+                            observation.dc,
+                            observation.kind,
+                            &observation.route,
+                            elapsed,
+                        );
+                        record_diagnostic(&format!(
+                            "route_first_byte kind={} dc={} elapsed_ms={}",
+                            observation.kind, observation.dc, elapsed_ms
+                        ));
+                    }
+                }
+            }
             STATS.bytes_down.fetch_add(n as i64, Ordering::Relaxed);
             if is_media { STATS.media_bytes_down.fetch_add(n as i64, Ordering::Relaxed); }
             down_bytes_c.fetch_add(n as i64, Ordering::Relaxed);
@@ -1424,6 +1449,32 @@ pub async fn bridge_ws<R, W>(
         }
     };
     let elapsed = now_monotonic() - start;
+    if let Some(observation) = route_observation.as_ref() {
+        let requested_upstream = up_bytes.load(Ordering::Relaxed) > 0;
+        let received_downstream = down_bytes.load(Ordering::Relaxed) > 0;
+        let client_closed_cleanly = close_reason == "normal"
+            || close_reason.starts_with("client: tcp_eof")
+            || close_reason.starts_with("client: canceled")
+            || close_reason.starts_with("client: write_failed");
+        if requested_upstream
+            && !received_downstream
+            && !client_closed_cleanly
+            && !first_byte_recorded.load(Ordering::Acquire)
+        {
+            crate::balancer::BALANCER.write().record_failure(
+                observation.dc,
+                observation.kind,
+                &observation.route,
+            );
+            STATS.first_byte_failures.fetch_add(1, Ordering::Relaxed);
+            record_diagnostic(&format!(
+                "route_first_byte_fail kind={} dc={} reason={}",
+                observation.kind,
+                observation.dc,
+                close_reason.replace(' ', "_")
+            ));
+        }
+    }
     record_diagnostic(&format!(
         "ws_session_end session={} dc={} media={} reason={} duration_ms={} up_bytes={} down_bytes={}",
         session_id,
@@ -1478,6 +1529,7 @@ pub async fn bridge_ws_stream(
         clt_enc,
         tg_enc,
         tg_dec,
+        None,
         cancel_token,
     )
     .await;
