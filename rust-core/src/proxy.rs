@@ -1113,8 +1113,8 @@ impl CfWorkerPool {
                     if self.generation.load(Ordering::Acquire) != generation
                         || crate::balancer::BALANCER.read().generation() != route_generation
                     {
-                        crate::balancer::BALANCER.write().cancel_attempt(
-                            dc, "cf_worker", &worker_domain, attempt_kind
+                        crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                            route_generation, dc, "cf_worker", &worker_domain, attempt_kind
                         );
                         ws.close().await;
                         return None;
@@ -1134,8 +1134,8 @@ impl CfWorkerPool {
                     if self.generation.load(Ordering::Acquire) != generation
                         || crate::balancer::BALANCER.read().generation() != route_generation
                     {
-                        crate::balancer::BALANCER.write().cancel_attempt(
-                            dc, "cf_worker", &worker_domain, attempt_kind
+                        crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                            route_generation, dc, "cf_worker", &worker_domain, attempt_kind
                         );
                         return None;
                     }
@@ -2347,14 +2347,13 @@ where
             let path = format!("/apiws?{}", query);
             let mut found = None;
             for worker_domain in pools.cf_worker.available_domains(dc, worker_domains.clone()).await {
-                let route_generation = crate::balancer::BALANCER.read().generation();
-                let attempt_kind = match crate::balancer::BALANCER
+                let (attempt_kind, route_generation) = match crate::balancer::BALANCER
                     .write()
-                    .begin_attempt(dc, "cf_worker", &worker_domain)
+                    .begin_attempt_with_generation(dc, "cf_worker", &worker_domain)
                 {
-                    Some(kind) => {
+                    Some((kind, generation)) => {
                         STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
-                        kind
+                        (kind, generation)
                     }
                     None => {
                         STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
@@ -2364,8 +2363,8 @@ where
                 let _dial_permit = match try_direct_ws_dial_slot() {
                     Some(permit) => permit,
                     None => {
-                        crate::balancer::BALANCER.write().cancel_attempt(
-                            dc, "cf_worker", &worker_domain, attempt_kind
+                        crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                            route_generation, dc, "cf_worker", &worker_domain, attempt_kind
                         );
                         record_diagnostic("direct_ws_dial_budget_saturated kind=cf_worker");
                         continue;
@@ -2378,8 +2377,8 @@ where
                 let route_started = Instant::now();
                 let attempt = tokio::select! {
                     _ = cancel_token.cancelled() => {
-                        crate::balancer::BALANCER.write().cancel_attempt(
-                            dc, "cf_worker", &worker_domain, attempt_kind
+                        crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                            route_generation, dc, "cf_worker", &worker_domain, attempt_kind
                         );
                         return false;
                     }
@@ -2403,14 +2402,14 @@ where
                     return false;
                 }
                 match &attempt {
-                    Ok(_) => crate::balancer::BALANCER.write().record_connect_success(
-                        dc, "cf_worker", &worker_domain, route_started.elapsed(), attempt_kind
+                    Ok(_) => crate::balancer::BALANCER.write().record_connect_success_for_generation(
+                        route_generation, dc, "cf_worker", &worker_domain, route_started.elapsed(), attempt_kind
                     ),
-                    Err(WsError::Canceled) => crate::balancer::BALANCER.write().cancel_attempt(
-                        dc, "cf_worker", &worker_domain, attempt_kind
+                    Err(WsError::Canceled) => crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                        route_generation, dc, "cf_worker", &worker_domain, attempt_kind
                     ),
-                    Err(_) => crate::balancer::BALANCER.write().record_attempt_failure(
-                        dc, "cf_worker", &worker_domain, attempt_kind
+                    Err(_) => crate::balancer::BALANCER.write().record_attempt_failure_for_generation(
+                        route_generation, dc, "cf_worker", &worker_domain, attempt_kind
                     ),
                 }
                 match attempt {
