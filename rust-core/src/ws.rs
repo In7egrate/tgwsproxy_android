@@ -996,11 +996,12 @@ pub async fn ws_connect_full_opts(
 // connectOneWS: перебор доменов (pool refill path, fronting-first как в оригинале).
 // A pooled socket keeps its selected hostname so a later real data exchange can
 // update the same route metric instead of counting the handshake as success.
-pub async fn connect_one_ws(ip: &str, domains: &[String]) -> Option<(RawWebSocket, String)> {
-    connect_one_ws_full(ip, domains, WS_PATH, WS_POOL_CONNECT_TIMEOUT).await
+pub async fn connect_one_ws(dc: i32, ip: &str, domains: &[String]) -> Option<(RawWebSocket, String)> {
+    connect_one_ws_full(dc, ip, domains, WS_PATH, WS_POOL_CONNECT_TIMEOUT).await
 }
 
 pub async fn connect_one_ws_full(
+    dc: i32,
     ip: &str,
     domains: &[String],
     path: &str,
@@ -1009,12 +1010,12 @@ pub async fn connect_one_ws_full(
     let fronting_first = crate::proxy::ws_pool_fronting_first();
     for domain in domains {
         let _connect_permits =
-            crate::proxy::acquire_route_connect_slot(0, "telegram_ws", domain).await?;
+            crate::proxy::acquire_route_connect_slot(dc, "telegram_ws", domain).await?;
         if !crate::balancer::BALANCER
             .write()
-            .allow_attempt(0, "telegram_ws", domain)
+            .allow_attempt(dc, "telegram_ws", domain)
         {
-            crate::config::record_diagnostic("route_circuit_skip kind=telegram_ws dc=0");
+            crate::config::record_diagnostic(&format!("route_circuit_skip kind=telegram_ws dc={}", dc));
             continue;
         }
 
@@ -1039,11 +1040,11 @@ pub async fn connect_one_ws_full(
                 if matches!(error, WsError::Canceled) {
                     crate::balancer::BALANCER
                         .write()
-                        .release_attempt(0, "telegram_ws", domain);
+                        .release_attempt(dc, "telegram_ws", domain);
                 } else {
                     crate::balancer::BALANCER
                         .write()
-                        .record_failure(0, "telegram_ws", domain);
+                        .record_failure(dc, "telegram_ws", domain);
                 }
                 if let WsError::Handshake(handshake) = &error {
                     if !handshake.is_redirect() {
