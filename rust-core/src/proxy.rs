@@ -2044,6 +2044,7 @@ where
                 .write()
                 .begin_attempt(dc, "cf_worker", &worker_domain);
             if let Some(attempt_kind) = attempt_kind {
+                STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
                 worker_observation = Some(RouteObservation {
                     dc_id: dc,
                     route_kind: "cf_worker".to_string(),
@@ -2057,6 +2058,7 @@ where
                 );
                 Some(ws)
             } else {
+                STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
                 ws.close().await;
                 record_diagnostic("route_circuit_skip kind=cf_worker pool=1");
                 None
@@ -2167,6 +2169,7 @@ where
                 return true;
             }
             if let Some(observation) = worker_observation.take() {
+                STATS.route_early_failures.fetch_add(1, Ordering::Relaxed);
                 crate::balancer::BALANCER.write().record_early_failure(
                     observation.dc_id, &observation.route_kind, &observation.route
                 );
@@ -2563,6 +2566,7 @@ async fn serve_core<R, W>(
                         .write()
                         .begin_attempt(dc, "telegram_ws", &route)
                     {
+                        STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
                         pooled_observation = Some(RouteObservation {
                             dc_id: dc,
                             route_kind: "telegram_ws".to_string(),
@@ -2572,6 +2576,7 @@ async fn serve_core<R, W>(
                         });
                         pooled_ws = Some(ws);
                     } else {
+                        STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
                         ws.close().await;
                     }
                 }
@@ -2645,6 +2650,7 @@ async fn serve_core<R, W>(
                 .write()
                 .begin_attempt(dc, "telegram_ws", &route)
             {
+                STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
                 route_observation = Some(RouteObservation {
                     dc_id: dc,
                     route_kind: "telegram_ws".to_string(),
@@ -2655,6 +2661,7 @@ async fn serve_core<R, W>(
                 ws_opt = Some(ws);
                 linfo!("[{}] DC{}{} -> pool hit via {}", label, dc, m_tag, target);
             } else {
+                STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
                 ws.close().await;
             }
         }
@@ -2849,6 +2856,7 @@ async fn serve_core<R, W>(
         lwarn!(" direct relayInit write fail DC{}{}: closed", dc, m_tag);
         ws.close().await;
         if let Some(observation) = route_observation.take() {
+            STATS.route_early_failures.fetch_add(1, Ordering::Relaxed);
             crate::balancer::BALANCER.write().record_early_failure(
                 observation.dc_id, &observation.route_kind, &observation.route
             );
@@ -2890,6 +2898,7 @@ async fn serve_core<R, W>(
                 route_observation = retry_observation;
                 if rws.send(&relay_init).await.is_err() {
                     if let Some(observation) = route_observation.take() {
+                        STATS.route_early_failures.fetch_add(1, Ordering::Relaxed);
                         crate::balancer::BALANCER.write().record_early_failure(
                             observation.dc_id, &observation.route_kind, &observation.route
                         );
