@@ -1774,10 +1774,10 @@ async fn try_cfproxy_base_domain(
     dc: i32,
     base_domain: &str,
     ws_path: &str,
-) -> (Option<RawWebSocket>, String) {
+) -> (Option<RawWebSocket>, String, Option<Instant>) {
     let base_domain = normalize_cf_domain(base_domain);
     if base_domain.is_empty() {
-        return (None, String::new());
+        return (None, String::new(), None);
     }
     let remaining = cfproxy_429_cooldown_remaining(&base_domain);
     if remaining > Duration::ZERO {
@@ -1786,7 +1786,7 @@ async fn try_cfproxy_base_domain(
             base_domain,
             remaining.as_secs_f64().ceil()
         );
-        return (None, String::new());
+        return (None, String::new(), None);
     }
     let _permit = match acquire_cfproxy_attempt_slot().await {
         Some(p) => p,
@@ -1803,6 +1803,7 @@ async fn try_cfproxy_base_domain(
 
     let domain = format!("kws{}.{}", dc, base_domain);
     ldebug!(" CF try {}", domain);
+    let route_started = Instant::now();
 
     let (ws, resolved_ip, err) = cf_connect_domain(&domain, ws_path, 5.0).await;
     if let Some(e) = err {
@@ -1842,7 +1843,7 @@ async fn try_cfproxy_base_domain(
     } else {
         ldebug!(" CF ok {} via hostname", domain);
     }
-    (ws, base_domain)
+    (ws, base_domain, Some(route_started))
 }
 
 // Только устанавливает WS-соединение через CF, НЕ трогая conn.
@@ -1851,7 +1852,7 @@ async fn cfproxy_acquire_ws(
     is_media: bool,
     ws_path: &str,
     cancel_token: &CancellationToken,
-) -> Option<(RawWebSocket, String)> {
+) -> Option<(RawWebSocket, String, Instant)> {
     let (enabled, domains) = {
         let cfg = CFPROXY.read();
         (
@@ -1876,6 +1877,7 @@ async fn cfproxy_acquire_ws(
 
     let mut ws: Option<RawWebSocket> = None;
     let mut chosen_domain = String::new();
+    let mut chosen_started = None;
 
     // Race all candidates (including the preferred domain) with bounded
     // concurrency. Awaiting JoinHandles in insertion order made a fast later
@@ -1893,8 +1895,8 @@ async fn cfproxy_acquire_ws(
                 _ = cancel.cancelled() => None,
                 result = async {
                     let _permit = sem.acquire_owned().await.ok()?;
-                    let (candidate, domain) = try_cfproxy_base_domain(dc, &base_domain, &path).await;
-                    candidate.map(|socket| (socket, domain))
+                    let (candidate, domain, started) = try_cfproxy_base_domain(dc, &base_domain, &path).await;
+                    candidate.zip(started).map(|(socket, started)| (socket, domain, started))
                 } => result,
             }
         });
@@ -1910,9 +1912,10 @@ async fn cfproxy_acquire_ws(
             }
             result = attempts.join_next() => {
                 match result {
-                    Some(Ok(Some((candidate, domain)))) => {
+                    Some(Ok(Some((candidate, domain, started)))) => {
                         ws = Some(candidate);
                         chosen_domain = domain;
+                        chosen_started = Some(started);
                         attempts.abort_all();
                         break;
                     }
@@ -1927,7 +1930,7 @@ async fn cfproxy_acquire_ws(
     // already completed successfully at the same time as the winner.
     attempts.abort_all();
     while let Some(result) = attempts.join_next().await {
-        if let Ok(Some((extra, _))) = result {
+        if let Ok(Some((extra, _, _))) = result {
             extra.close().await;
         }
     }
@@ -1945,7 +1948,7 @@ async fn cfproxy_acquire_ws(
                     linfo!(" CF домен для DC{} -> {}", dc, chosen_domain);
                 }
             }
-            Some((w, chosen_domain))
+            Some((w, chosen_domain, chosen_started.unwrap_or_else(Instant::now)))
         }
         None => {
             lwarn!(" CF fallback DC{}{}: все CF домены недоступны", dc, m_tag);
@@ -2086,8 +2089,7 @@ where
     // Шаг 2: cf-ws (без halves).
     if use_cf {
         record_diagnostic(&format!("route_attempt kind=cf_proxy dc={} media={}", dc, is_media as u8));
-        let route_started = Instant::now();
-        if let Some((ws, chosen_domain)) =
+        if let Some((ws, chosen_domain, route_started)) =
             cfproxy_acquire_ws(dc, is_media, ws_path, &cancel_token).await
         {
             STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
