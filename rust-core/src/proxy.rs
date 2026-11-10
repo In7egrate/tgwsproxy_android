@@ -1067,19 +1067,17 @@ impl CfWorkerPool {
             if self.generation.load(Ordering::Acquire) != generation {
                 return None;
             }
-            let route_generation = crate::balancer::BALANCER.read().generation();
-            let attempt_kind = match crate::balancer::BALANCER
+            let (attempt_kind, route_generation) = match crate::balancer::BALANCER
                 .write()
-                .begin_attempt(dc, "cf_worker", &worker_domain)
+                .begin_attempt_with_generation(dc, "cf_worker", &worker_domain)
             {
-                Some(RouteAttemptKind::Closed) => {
+                Some((RouteAttemptKind::Closed, generation)) => {
                     STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
-                    RouteAttemptKind::Closed
+                    (RouteAttemptKind::Closed, generation)
                 }
-                Some(RouteAttemptKind::HalfOpen) => {
-                    // Do not reserve recovery on an idle prewarmed socket.
-                    crate::balancer::BALANCER.write().cancel_attempt(
-                        dc, "cf_worker", &worker_domain, RouteAttemptKind::HalfOpen
+                Some((RouteAttemptKind::HalfOpen, generation)) => {
+                    crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                        generation, dc, "cf_worker", &worker_domain, RouteAttemptKind::HalfOpen
                     );
                     continue;
                 }
@@ -1091,8 +1089,8 @@ impl CfWorkerPool {
             let _dial_permit = match try_direct_ws_dial_slot() {
                 Some(permit) => permit,
                 None => {
-                    crate::balancer::BALANCER.write().cancel_attempt(
-                        dc, "cf_worker", &worker_domain, attempt_kind
+                    crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                        route_generation, dc, "cf_worker", &worker_domain, attempt_kind
                     );
                     record_diagnostic("direct_ws_dial_budget_saturated kind=cf_worker_pool");
                     continue;
@@ -1101,8 +1099,8 @@ impl CfWorkerPool {
             let started = Instant::now();
             let attempt = tokio::select! {
                 _ = cancel.cancelled() => {
-                    crate::balancer::BALANCER.write().cancel_attempt(
-                        dc, "cf_worker", &worker_domain, attempt_kind
+                    crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                        route_generation, dc, "cf_worker", &worker_domain, attempt_kind
                     );
                     return None;
                 }
@@ -1121,14 +1119,14 @@ impl CfWorkerPool {
                         ws.close().await;
                         return None;
                     }
-                    crate::balancer::BALANCER.write().record_connect_success(
-                        dc, "cf_worker", &worker_domain, started.elapsed(), attempt_kind
+                    crate::balancer::BALANCER.write().record_connect_success_for_generation(
+                        route_generation, dc, "cf_worker", &worker_domain, started.elapsed(), attempt_kind
                     );
                     return Some((ws, worker_domain, route_generation));
                 }
                 Err(WsError::Canceled) => {
-                    crate::balancer::BALANCER.write().cancel_attempt(
-                        dc, "cf_worker", &worker_domain, attempt_kind
+                    crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                        route_generation, dc, "cf_worker", &worker_domain, attempt_kind
                     );
                     return None;
                 }
@@ -1141,8 +1139,8 @@ impl CfWorkerPool {
                         );
                         return None;
                     }
-                    crate::balancer::BALANCER.write().record_attempt_failure(
-                        dc, "cf_worker", &worker_domain, attempt_kind
+                    crate::balancer::BALANCER.write().record_attempt_failure_for_generation(
+                        route_generation, dc, "cf_worker", &worker_domain, attempt_kind
                     );
                     self.report_failure_generation(&worker_domain, &exc, generation).await;
                 }
@@ -2399,8 +2397,8 @@ where
                     if let Ok(stale_ws) = attempt {
                         stale_ws.close().await;
                     }
-                    crate::balancer::BALANCER.write().cancel_attempt(
-                        dc, "cf_worker", &worker_domain, attempt_kind
+                    crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                        route_generation, dc, "cf_worker", &worker_domain, attempt_kind
                     );
                     record_diagnostic("cf_worker_result_ignored reason=network_generation_changed");
                     return false;
