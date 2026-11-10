@@ -457,6 +457,11 @@ pub extern "C" fn GetStatsJson() -> *mut c_char {
         "ws_ping_rtt_ms": n(&STATS.ws_ping_rtt_ms),
         "ws_ping_samples": n(&STATS.ws_ping_samples),
         "ws_ping_timeouts": n(&STATS.ws_ping_timeouts),
+        "first_byte_last_ms": n(&STATS.first_byte_last_ms),
+        "first_byte_avg_ms": if n(&STATS.first_byte_count) == 0 { 0 }
+            else { n(&STATS.first_byte_total_ms) / n(&STATS.first_byte_count) },
+        "first_byte_count": n(&STATS.first_byte_count),
+        "first_byte_failures": n(&STATS.first_byte_failures),
         "ws_setup_avg_ms": if n(&STATS.ws_setup_count) == 0 { 0 }
             else { n(&STATS.ws_setup_total_ms) / n(&STATS.ws_setup_count) },
         "pool_config": POOL_SIZE.load(Ordering::Relaxed),
