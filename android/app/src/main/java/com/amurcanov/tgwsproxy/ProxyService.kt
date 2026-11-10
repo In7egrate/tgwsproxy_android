@@ -385,7 +385,9 @@ class ProxyService : Service() {
         val dnsCount = properties.dnsServers.size
         val summary = "ipv4=$ipv4 ipv6=$ipv6 default_routes=$defaultRoutes routes=$routeCount dns_count=$dnsCount mtu=${properties.mtu}"
         val networkKey = network.hashCode().toString()
-        val fingerprint = "$networkKey|$ipv4|$ipv6|$defaultRoutes|$routeCount|$dnsCount|${properties.mtu}"
+        // Hash route/address objects in memory so gateway or address changes are detected without exporting them.
+        // DNS-count-only changes are diagnostic, but do not force established sockets to be discarded.
+        val fingerprint = "$networkKey|${properties.routes.hashCode()}|${properties.linkAddresses.hashCode()}|${properties.mtu}"
         val previous = lastLinkFingerprint
         if (fingerprint == previous) return
         lastLinkFingerprint = fingerprint
