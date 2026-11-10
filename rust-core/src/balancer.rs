@@ -551,7 +551,7 @@ mod adaptive_route_tests {
         assert_eq!(ranked[0], "kws2-1.web.telegram.org");
         let snapshot = serde_json::to_string(&balancer.metrics_snapshot()).unwrap();
         assert!(snapshot.contains("connect_only"));
-        assert!(snapshot.contains("\\"first_byte_samples\\":0"));
+        assert!(snapshot.contains("\"first_byte_samples\":0"));
     }
 
     #[test]
