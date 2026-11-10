@@ -138,6 +138,7 @@ pub struct DcSlot {
 
 pub struct PoolEntry {
     pub ws: RawWebSocket,
+    pub route: String,
     pub created: f64, // monotonic, как time.monotonic() в оригинале
     // Permit bounds the total number of idle pooled sockets across all DC/media slots.
     _budget_permit: OwnedSemaphorePermit,
@@ -219,7 +220,7 @@ impl WsPool {
         is_media: bool,
         target_ip: String,
         domains: Vec<String>,
-    ) -> Option<RawWebSocket> {
+    ) -> Option<(RawWebSocket, String)> {
         let slot = DcSlot {
             dc,
             is_media: is_media_int(is_media),
@@ -239,7 +240,7 @@ impl WsPool {
         }
         let now = now_monotonic();
 
-        let mut ws: Option<RawWebSocket> = None;
+        let mut ws: Option<(RawWebSocket, String)> = None;
         let mut stale_sockets = Vec::new();
         {
             let mut q = state.queue.lock().await;
@@ -256,7 +257,7 @@ impl WsPool {
                     age,
                     q.len()
                 );
-                ws = Some(entry.ws);
+                ws = Some((entry.ws, entry.route));
                 break;
             }
         }
@@ -267,7 +268,7 @@ impl WsPool {
         while closing.join_next().await.is_some() {}
 
         if self.generation.load(Ordering::Acquire) != generation {
-            if let Some(socket) = ws.take() {
+            if let Some((socket, _route)) = ws.take() {
                 socket.close().await;
             }
             return None;
@@ -386,17 +387,17 @@ impl WsPool {
                 }
                 let socket = tokio::select! {
                     _ = cancel.cancelled() => None,
-                    result = connect_one_ws(&target_ip, &domains) => result,
+                    result = connect_one_ws_with_domain(&target_ip, &domains) => result,
                 };
-                socket.map(|ws| (ws, permit))
+                socket.map(|(ws, route)| (ws, route, permit))
             });
         }
 
         let mut connected = 0;
         // Completion-order handling: a slow TLS attempt cannot hold ready media sockets.
         while let Some(result) = handles.join_next().await {
-            if let Ok(Some((ws, permit))) = result {
-                let mut candidate = Some((ws, permit));
+            if let Ok(Some((ws, route, permit))) = result {
+                let mut candidate = Some((ws, route, permit));
                 {
                     // Lock order matches reset/close_all. If reset advances the
                     // generation while this lock is held, reset drains this entry
@@ -407,10 +408,11 @@ impl WsPool {
                     if is_current {
                         let mut queue = state.queue.lock().await;
                         if queue.len() < 16 {
-                            let (ws, budget_permit) =
+                            let (ws, route, budget_permit) =
                                 candidate.take().expect("candidate socket is present");
                             queue.push_back(PoolEntry {
                                 ws,
+                                route,
                                 created: now_monotonic(),
                                 _budget_permit: budget_permit,
                             });
@@ -418,7 +420,7 @@ impl WsPool {
                         }
                     }
                 }
-                if let Some((socket, budget_permit)) = candidate {
+                if let Some((socket, _route, budget_permit)) = candidate {
                     socket.close().await;
                     drop(budget_permit);
                 }
