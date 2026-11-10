@@ -5,7 +5,7 @@
 [🇷🇺 Русский](README.md) · [🇬🇧 English](README.en.md)
 
 [![Android 7.0+](https://img.shields.io/badge/Android-7.0%2B-3DDC84?logo=android&logoColor=white)](https://developer.android.com/about/versions/nougat)
-[![Version](https://img.shields.io/badge/version-1.0.0-111111)](https://github.com/In7egrate/tgwsproxy_android/releases)
+[![Version](https://img.shields.io/badge/version-1.0.1-111111)](https://github.com/In7egrate/tgwsproxy_android/releases)
 [![Kotlin](https://img.shields.io/badge/Kotlin-Jetpack%20Compose-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Rust](https://img.shields.io/badge/native-Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 
