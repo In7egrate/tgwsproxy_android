@@ -2309,37 +2309,42 @@ where
             .get(dc, fallback_dst.clone(), worker_domains.clone())
             .await;
         let mut worker_observation: Option<RouteObservation> = None;
-        let worker_ws = if let Some((ws, worker_domain, route_generation)) = pooled {
-            if crate::balancer::BALANCER.read().generation() != route_generation {
-                ws.close().await;
-                STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
-                record_diagnostic("route_circuit_skip kind=cf_worker stale_pool=1");
-                None
-            } else {
-            let attempt_kind = crate::balancer::BALANCER
+        let worker_ws = if let Some((ws, worker_domain, pool_route_generation)) = pooled {
+            match crate::balancer::BALANCER
                 .write()
-                .begin_attempt(dc, "cf_worker", &worker_domain);
-            if let Some(attempt_kind) = attempt_kind {
-                STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
-                worker_observation = Some(RouteObservation {
-                    dc_id: dc,
-                    route_kind: "cf_worker".to_string(),
-                    route: worker_domain.clone(),
-                    attempt_kind,
-                    connected_at: Instant::now(),
-                    generation: route_generation,
-                });
-                linfo!(
-                    "[{}] DC{}{} -> CF worker pool hit via {} for {}",
-                    label, dc, m_tag, worker_domain, fallback_dst
-                );
-                Some(ws)
-            } else {
-                STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
-                ws.close().await;
-                record_diagnostic("route_circuit_skip kind=cf_worker pool=1");
-                None
-            }
+                .begin_attempt_with_generation(dc, "cf_worker", &worker_domain)
+            {
+                Some((attempt_kind, route_generation)) if route_generation == pool_route_generation => {
+                    STATS.route_attempts.fetch_add(1, Ordering::Relaxed);
+                    worker_observation = Some(RouteObservation {
+                        dc_id: dc,
+                        route_kind: "cf_worker".to_string(),
+                        route: worker_domain.clone(),
+                        attempt_kind,
+                        connected_at: Instant::now(),
+                        generation: route_generation,
+                    });
+                    linfo!(
+                        "[{}] DC{}{} -> CF worker pool hit via {} for {}",
+                        label, dc, m_tag, worker_domain, fallback_dst
+                    );
+                    Some(ws)
+                }
+                Some((attempt_kind, route_generation)) => {
+                    crate::balancer::BALANCER.write().cancel_attempt_for_generation(
+                        route_generation, dc, "cf_worker", &worker_domain, attempt_kind
+                    );
+                    STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
+                    ws.close().await;
+                    record_diagnostic("route_circuit_skip kind=cf_worker stale_pool=1");
+                    None
+                }
+                None => {
+                    STATS.route_circuit_skips.fetch_add(1, Ordering::Relaxed);
+                    ws.close().await;
+                    record_diagnostic("route_circuit_skip kind=cf_worker pool=1");
+                    None
+                }
             }
         } else {
             let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
