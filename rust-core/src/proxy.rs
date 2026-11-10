@@ -1439,6 +1439,7 @@ pub async fn bridge_ws<R, W>(
             && close_reason != "upstream: canceled";
         let send_failed = close_reason.contains("send_failed");
         if (request_was_sent && upstream_failed) || send_failed {
+            STATS.route_early_failures.fetch_add(1, Ordering::Relaxed);
             crate::balancer::BALANCER.write().record_early_failure(
                 observation.dc_id,
                 &observation.route_kind,
