@@ -65,7 +65,12 @@ jobs:
           app_version="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' android/app/build.gradle.kts | head -n 1)"
           app_version_code="$(sed -nE 's/^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' android/app/build.gradle.kts | head -n 1)"
           tag_version="${GITHUB_REF_NAME#v}"
-          if [[ -z "$app_version" || "$app_version" != "$tag_version" ]]; then
+          if [[ ! "$tag_version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)([-.]?[A-Za-z][A-Za-z0-9.-]*)?$ ]]; then
+            echo "Tag ${GITHUB_REF_NAME} is not a supported Android release tag." >&2
+            exit 1
+          fi
+          tag_base_version="${BASH_REMATCH[1]}"
+          if [[ -z "$app_version" || "$app_version" != "$tag_base_version" ]]; then
             echo "Tag ${GITHUB_REF_NAME} does not match Android versionName ${app_version:-<missing>}." >&2
             exit 1
           fi
@@ -237,6 +242,8 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: WS Proxy ${{ github.ref_name }}
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'rc') }}
+          make_latest: ${{ !contains(github.ref_name, 'beta') && !contains(github.ref_name, 'alpha') && !contains(github.ref_name, 'rc') }}
           fail_on_unmatched_files: true
           files: |
             android/app/build/outputs/apk/release/*.apk
